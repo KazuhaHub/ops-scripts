@@ -18,14 +18,32 @@
 # Password-only login is rejected.
 #
 # Usage:
-#   sudo ./install-duo-ssh.sh                      # interactive: prompts for creds
+#   sudo ./install-duo-ssh.sh                      # interactive menu (TTY) — guided setup
+#   sudo kh-duo                                     # same, after --install-shortcut
 #   sudo ./install-duo-ssh.sh --ikey X --skey Y --host Z
-#   sudo DUO_IKEY=X DUO_SKEY=Y DUO_HOST=Z ./install-duo-ssh.sh
+#   sudo DUO_IKEY=X DUO_SKEY=Y DUO_HOST=Z ./install-duo-ssh.sh --yes
 #   sudo ./install-duo-ssh.sh --breakglass emergency   # exempt a user from Duo
 #   sudo ./install-duo-ssh.sh --no-bypass-local         # disable default localhost bypass
 #   sudo ./install-duo-ssh.sh --bypass-addr 10.0.0.0/8 # extra CIDRs to bypass Duo
 #   sudo ./install-duo-ssh.sh --allow-password         # also allow password+Duo via PAM (publickey users still skip password)
 #   sudo ./install-duo-ssh.sh --uninstall              # revert to stock SSH config
+#   sudo ./install-duo-ssh.sh --no-menu                # force flag-driven mode even on TTY
+#
+# Maintenance:
+#   sudo ./install-duo-ssh.sh --install-shortcut       # create /usr/local/bin/kh-duo → this script
+#   sudo ./install-duo-ssh.sh --check-update           # compare local SCRIPT_VERSION to upstream
+#   sudo ./install-duo-ssh.sh --self-update            # download latest from GitHub and replace
+#   sudo ./install-duo-ssh.sh --version                # print version and exit
+#
+# Env vars:
+#   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
+#   KH_DUO_UPDATE_URL                override upstream raw URL (forks / mirrors)
+#   KH_DUO_SHORTCUT                  override shortcut path (default /usr/local/bin/kh-duo)
+#
+# Modes:
+#   - No flags + TTY            → interactive menu (install / uninstall / update / shortcut)
+#   - Any flag passed           → flag-driven, no menu (back-compatible automation)
+#   - Non-TTY (pipe/Ansible)    → flag-driven; missing creds will fail-fast
 #
 # Safe to re-run: idempotent, creates timestamped backups, rolls back on error.
 
@@ -42,10 +60,21 @@ ALLOW_PASSWORD=0
 SKIP_KEY_CHECK=0
 UNINSTALL=0
 ASSUME_YES=0
+NO_MENU=0
+INTERACTIVE_FLAGS_USED=0
+ACTION_CHECK_UPDATE=0
+ACTION_SELF_UPDATE=0
+ACTION_INSTALL_SHORTCUT=0
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/duo-install-backup-${TS}"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+# Self-update / shortcut — both URL and path can be overridden via env var
+# (useful for forks, internal mirrors, or non-standard PATH layouts).
+SCRIPT_VERSION="1.1.0"
+SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
+SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
 
 # Minimum required Duo Unix version (CA bundle expiry on 2026-04-15 — see docs)
 DUO_MIN_MAJOR=2
@@ -61,11 +90,15 @@ OS_FAMILY=""    # debian | rhel
 PKG_MGR=""      # apt | yum | dnf
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    # Print every contiguous comment line at the top of the file (header
+    # block).  Stops at the first non-comment line so adding code below
+    # doesn't break --help.
+    awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
+    INTERACTIVE_FLAGS_USED=1
     case "$1" in
         --ikey)         IKEY="$2"; shift 2 ;;
         --skey)         SKEY="$2"; shift 2 ;;
@@ -77,6 +110,11 @@ while [[ $# -gt 0 ]]; do
         --allow-password) ALLOW_PASSWORD=1; shift ;;
         --skip-key-check) SKIP_KEY_CHECK=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
+        --no-menu)      NO_MENU=1; shift ;;
+        --check-update) ACTION_CHECK_UPDATE=1; shift ;;
+        --self-update)  ACTION_SELF_UPDATE=1; shift ;;
+        --install-shortcut) ACTION_INSTALL_SHORTCUT=1; shift ;;
+        --version|-V)   printf 'install-duo-ssh.sh %s\n' "${SCRIPT_VERSION:-unknown}"; exit 0 ;;
         -y|--yes)       ASSUME_YES=1; shift ;;
         -h|--help)      usage 0 ;;
         *) echo "Unknown arg: $1" >&2; usage 1 ;;
@@ -95,6 +133,267 @@ confirm() {
     local prompt="$1"
     read -r -p "$prompt [y/N] " ans
     [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+### ─── Self-update / shortcut ────────────────────────────────────────────
+ver_lt() {
+    [[ "$1" == "$2" ]] && return 1
+    local lower
+    lower="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)"
+    [[ "$lower" == "$1" ]]
+}
+
+# Echoes the SCRIPT_VERSION value found in the upstream file.  Empty/non-zero
+# return means the network or parse failed — caller decides what to do.
+fetch_remote_version() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local tmp version
+    tmp="$(mktemp)" || return 1
+    if ! curl -fsSL --max-time 10 "$SCRIPT_RAW_URL" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    version="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$tmp")"
+    rm -f "$tmp"
+    [[ -n "$version" ]] || return 1
+    printf '%s' "$version"
+}
+
+# Downloads the upstream script, sanity-checks it, then atomically replaces
+# the running script.  Backup of the previous version is kept alongside.
+self_update() {
+    command -v curl >/dev/null 2>&1 || die "curl is required for self-update"
+    log "Downloading $SCRIPT_RAW_URL ..."
+    local tmp
+    tmp="$(mktemp)" || die "mktemp failed"
+    if ! curl -fsSL --max-time 30 "$SCRIPT_RAW_URL" -o "$tmp"; then
+        rm -f "$tmp"; die "Download failed"
+    fi
+    head -1 "$tmp" | grep -qE '^#!/(usr/bin/env[[:space:]]+bash|bin/bash)' || {
+        rm -f "$tmp"; die "Downloaded file is not a bash script — refusing to install"
+    }
+    bash -n "$tmp" 2>/dev/null || {
+        rm -f "$tmp"; die "Downloaded file failed syntax check — refusing to install"
+    }
+    local backup="${SCRIPT_PATH}.bak.${TS}"
+    cp -a "$SCRIPT_PATH" "$backup" || die "Backup of current script failed"
+    if ! install -m 755 "$tmp" "$SCRIPT_PATH" 2>/dev/null; then
+        # /usr/bin/install may not exist on truly minimal images — fall back
+        cp "$tmp" "$SCRIPT_PATH" && chmod 755 "$SCRIPT_PATH" || {
+            rm -f "$tmp"; die "Install of new script failed"
+        }
+    fi
+    rm -f "$tmp"
+    ok "Self-update complete (backup: $backup)"
+}
+
+# Creates /usr/local/bin/kh-duo (or $KH_DUO_SHORTCUT) → $SCRIPT_PATH.
+install_shortcut() {
+    [[ -f "$SCRIPT_PATH" ]] || die "Cannot find script at '$SCRIPT_PATH'"
+    case "$SCRIPT_PATH" in
+        /tmp/*|/var/tmp/*)
+            warn "Script lives at $SCRIPT_PATH — temp filesystems may be cleared on reboot,"
+            warn "leaving '$SHORTCUT_PATH' broken.  Move the script somewhere persistent first"
+            warn "(e.g. /usr/local/sbin/install-duo-ssh.sh) before installing the shortcut."
+            confirm "Install shortcut anyway?" || return 0
+            ;;
+    esac
+    if [[ -e "$SHORTCUT_PATH" || -L "$SHORTCUT_PATH" ]]; then
+        local existing=""
+        existing="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+        if [[ "$existing" == "$SCRIPT_PATH" ]]; then
+            ok "Shortcut already installed: $SHORTCUT_PATH → $SCRIPT_PATH"
+            return 0
+        fi
+        warn "$SHORTCUT_PATH already exists${existing:+ (currently → $existing)}"
+        confirm "Replace it?" || return 0
+        rm -f "$SHORTCUT_PATH"
+    fi
+    mkdir -p "$(dirname "$SHORTCUT_PATH")"
+    ln -s "$SCRIPT_PATH" "$SHORTCUT_PATH" || die "Failed to create symlink at $SHORTCUT_PATH"
+    ok "Shortcut installed: $SHORTCUT_PATH → $SCRIPT_PATH"
+    ok "From now on, just run:  sudo $(basename "$SHORTCUT_PATH")"
+}
+
+### ─── Interactive menu ──────────────────────────────────────────────────
+# Triggered when no flags are passed AND stdin is a TTY.  Sets the same
+# globals that the flag parser sets, so the rest of the script doesn't
+# care which path produced the configuration.
+menu_should_run() {
+    [[ $NO_MENU -eq 1 ]] && return 1
+    [[ $INTERACTIVE_FLAGS_USED -eq 1 ]] && return 1
+    [[ -t 0 && -t 1 ]] || return 1
+    return 0
+}
+
+# read into the named variable, with a default and a one-line prompt.
+menu_ask() {
+    local var="$1" prompt="$2" default="${3:-}" ans=""
+    if [[ -n "$default" ]]; then
+        read -r -p "  $prompt [$default]: " ans
+        ans="${ans:-$default}"
+    else
+        read -r -p "  $prompt: " ans
+    fi
+    printf -v "$var" '%s' "$ans"
+}
+
+menu_yes_no() {
+    local prompt="$1" default="$2" ans=""
+    local hint="[y/N]"
+    [[ "$default" == "y" ]] && hint="[Y/n]"
+    read -r -p "  $prompt $hint: " ans
+    ans="${ans:-$default}"
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+menu_uninstall_flow() {
+    UNINSTALL=1
+    echo
+    warn "Uninstall will:"
+    echo "    - remove the Duo PAM stack from $PAM_SSHD"
+    echo "    - remove AuthenticationMethods from $SSHD_CONFIG"
+    echo "    - uninstall the duo-unix package and its repo entry"
+    echo "    - restart sshd"
+    echo
+    confirm "Proceed with uninstall?" || { ok "Cancelled."; exit 0; }
+}
+
+menu_check_and_update() {
+    log "Local version: $SCRIPT_VERSION"
+    log "Checking $SCRIPT_RAW_URL ..."
+    local remote
+    if ! remote="$(fetch_remote_version)" || [[ -z "$remote" ]]; then
+        warn "Could not fetch remote version (offline or upstream unreachable)"
+        return 0
+    fi
+    if [[ "$remote" == "$SCRIPT_VERSION" ]]; then
+        ok "You are on the latest version ($SCRIPT_VERSION)"
+        return 0
+    fi
+    if ver_lt "$remote" "$SCRIPT_VERSION"; then
+        ok "Local $SCRIPT_VERSION is ahead of upstream $remote (development build)"
+        return 0
+    fi
+    warn "Update available: $SCRIPT_VERSION → $remote"
+    confirm "Download and install now?" || { ok "Skipped."; return 0; }
+    self_update
+    ok "Re-run the script to use the new version: sudo $SCRIPT_PATH"
+    exit 0
+}
+
+install_wizard() {
+    # ── Step 1/5 — credentials ─────────────────────────────────────────
+    echo
+    log "Step 1/5 — Duo Application Credentials"
+    echo "  Find these in: Duo Admin Panel → Applications → UNIX Application"
+    if [[ -n "$IKEY" ]]; then
+        ok "  ikey already provided (${IKEY:0:6}…) — keeping it"
+    else
+        menu_ask IKEY "Integration key (ikey)"
+    fi
+    if [[ -n "$SKEY" ]]; then
+        ok "  skey already provided — keeping it"
+    else
+        read -r -s -p "  Secret key (skey): " SKEY; echo
+    fi
+    if [[ -n "$HOST" ]]; then
+        ok "  host already provided ($HOST) — keeping it"
+    else
+        menu_ask HOST "API host (api-XXXXXXXX.duosecurity.com)"
+    fi
+
+    # ── Step 2/5 — login methods ───────────────────────────────────────
+    echo
+    log "Step 2/5 — Login Methods"
+    echo "  Default: only publickey+Duo logins are allowed (password is rejected)."
+    echo "  Allow password+Duo as a fallback for users without SSH keys?"
+    if menu_yes_no "Allow password fallback?" "n"; then
+        ALLOW_PASSWORD=1
+    fi
+
+    # ── Step 3/5 — localhost bypass ────────────────────────────────────
+    echo
+    log "Step 3/5 — Localhost Bypass"
+    echo "  Skip Duo for connections from 127.0.0.0/8 and ::1"
+    echo "  (recommended — lets local cron jobs and scripts SSH to themselves)."
+    if menu_yes_no "Bypass Duo for localhost?" "y"; then
+        BYPASS_LOCAL=1
+    else
+        BYPASS_LOCAL=0
+    fi
+
+    # ── Step 4/5 — extra bypass CIDRs ──────────────────────────────────
+    echo
+    log "Step 4/5 — Extra Bypass CIDRs (optional)"
+    echo "  Comma-separated networks that skip Duo (e.g. 10.0.0.0/8,192.168.0.0/16)."
+    echo "  Press Enter to skip."
+    local extra=""
+    menu_ask extra "Bypass CIDRs"
+    [[ -n "$extra" ]] && BYPASS_ADDRS="$extra"
+
+    # ── Step 5/5 — breakglass user ─────────────────────────────────────
+    echo
+    log "Step 5/5 — Breakglass User (optional)"
+    echo "  A username that bypasses Duo entirely (publickey only)."
+    echo "  For emergency recovery — use sparingly.  Press Enter to skip."
+    local bg=""
+    menu_ask bg "Breakglass username"
+    [[ -n "$bg" ]] && BREAKGLASS_USER="$bg"
+
+    # ── Confirmation summary ───────────────────────────────────────────
+    echo
+    cat <<EOF
+─────────────────────────────────────────────────────────────────────────
+  Summary
+  -------
+  Action:               Install / configure
+  ikey:                 ${IKEY:0:8}…
+  host:                 $HOST
+  Password fallback:    $([[ $ALLOW_PASSWORD -eq 1 ]] && echo "yes (publickey OR password+Duo)" || echo "no  (publickey+Duo only)")
+  Localhost bypass:     $([[ $BYPASS_LOCAL -eq 1 ]] && echo "yes (127.0.0.0/8, ::1)" || echo "no")
+  Extra bypass CIDRs:   ${BYPASS_ADDRS:-(none)}
+  Breakglass user:      ${BREAKGLASS_USER:-(none)}
+─────────────────────────────────────────────────────────────────────────
+EOF
+    if ! confirm "Proceed with this configuration?"; then
+        ok "Cancelled. No changes made."
+        exit 0
+    fi
+    ASSUME_YES=1   # user already confirmed; don't ask again later
+}
+
+interactive_menu() {
+    cat <<BANNER
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║         Duo 2FA for SSH — Interactive Setup                          ║
+╚═══════════════════════════════════════════════════════════════════════╝
+  install-duo-ssh.sh v${SCRIPT_VERSION}   (use --no-menu or any flag to skip the wizard)
+BANNER
+
+    while true; do
+        cat <<'EOF'
+
+What would you like to do?
+  1) Install / configure Duo 2FA  (default)
+  2) Uninstall Duo 2FA
+  3) Check for script updates
+  4) Install / refresh the 'kh-duo' shortcut
+  5) Quit without changes
+
+EOF
+        local action=""
+        read -r -p "Choice [1]: " action
+        case "${action:-1}" in
+            1|"") install_wizard; return 0 ;;
+            2)    menu_uninstall_flow; return 0 ;;
+            3)    menu_check_and_update ;;
+            4)    install_shortcut ;;
+            5)    ok "No changes made."; exit 0 ;;
+            *)    warn "Invalid choice '$action'" ;;
+        esac
+    done
 }
 
 ### ─── OS detection ──────────────────────────────────────────────────────
@@ -688,7 +987,37 @@ fix_selinux() {
 ### ─── Main ───────────────────────────────────────────────────────────────
 require_root
 detect_os
+
+# Quick-exit action flags — these don't touch SSH/PAM at all, so they bypass
+# the heavier ensure_python3 / install / patch path entirely.
+if [[ $ACTION_CHECK_UPDATE -eq 1 ]]; then
+    log "Local version: $SCRIPT_VERSION"
+    log "Checking $SCRIPT_RAW_URL ..."
+    remote_ver="$(fetch_remote_version)" || { warn "Could not fetch remote version (offline?)"; exit 1; }
+    if [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+        ok "You are on the latest version ($SCRIPT_VERSION)"
+    elif ver_lt "$remote_ver" "$SCRIPT_VERSION"; then
+        ok "Local $SCRIPT_VERSION is ahead of upstream $remote_ver (development build)"
+    else
+        warn "Update available: $SCRIPT_VERSION → $remote_ver  (run --self-update to apply)"
+    fi
+    exit 0
+fi
+if [[ $ACTION_SELF_UPDATE -eq 1 ]]; then
+    self_update
+    ok "Done. Re-run: sudo $SCRIPT_PATH"
+    exit 0
+fi
+if [[ $ACTION_INSTALL_SHORTCUT -eq 1 ]]; then
+    install_shortcut
+    exit 0
+fi
+
 ensure_python3
+
+if menu_should_run; then
+    interactive_menu
+fi
 
 [[ $UNINSTALL -eq 1 ]] && do_uninstall
 
