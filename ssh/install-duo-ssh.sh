@@ -84,7 +84,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 SCRIPT_TRUSTED_URL_PREFIX="https://raw.githubusercontent.com/"
 SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
@@ -1179,20 +1179,20 @@ trap - ERR
 cat <<EOF
 
 ╔═══════════════════════════════════════════════════════════════════════╗
-║  Duo 2FA for SSH — installation complete                            ║
+║  Duo 2FA for SSH — installation complete                              ║
 ╠═══════════════════════════════════════════════════════════════════════╣
-║  OS:                 $(printf '%-48s' "${PRETTY_NAME:-$ID}")║
-║  Duo version:        $(printf '%-48s' "$(get_duo_version)")║
-║  pam_duo.so:         $(printf '%-48s' "$PAM_DUO_SO")║
-║  Login requirement:  $(printf '%-48s' "publickey$( [[ $ALLOW_PASSWORD -eq 1 ]] && echo ' OR password') + Duo")║
-$( [[ -n "$BREAKGLASS_USER" ]] && printf '║  Breakglass user:    %-48s║\n' "$BREAKGLASS_USER (publickey only)")
-║  Backups:            $(printf '%-48s' "$BACKUP_DIR")║
-║                                                                     ║
-║  DO NOT CLOSE THIS SESSION YET.                                     ║
-║  Open a NEW terminal and test SSH login first.                      ║
-║                                                                     ║
-║  To uninstall:                                                      ║
-║    sudo $SCRIPT_PATH --uninstall
+║  OS:                 $(printf '%-49s' "${PRETTY_NAME:-$ID}")║
+║  Duo version:        $(printf '%-49s' "$(get_duo_version)")║
+║  pam_duo.so:         $(printf '%-49s' "$PAM_DUO_SO")║
+║  Login requirement:  $(printf '%-49s' "publickey$( [[ $ALLOW_PASSWORD -eq 1 ]] && echo ' OR password') + Duo")║
+$( [[ -n "$BREAKGLASS_USER" ]] && printf '║  Breakglass user:    %-49s║\n' "$BREAKGLASS_USER (publickey only)")
+║  Backups:            $(printf '%-49s' "$BACKUP_DIR")║
+║                                                                       ║
+║  DO NOT CLOSE THIS SESSION YET.                                       ║
+║  Open a NEW terminal and test SSH login first.                        ║
+║                                                                       ║
+║  To uninstall:                                                        ║
+║    $(printf '%-67s' "sudo $SCRIPT_PATH --uninstall")║
 ╚═══════════════════════════════════════════════════════════════════════╝
 
 EOF
