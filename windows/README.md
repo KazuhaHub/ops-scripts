@@ -4,13 +4,39 @@ Windows 设备的 ORG 策略配置脚本。所有写注册表的动作都需要 
 
 | Script | Description |
 | --- | --- |
+| [Install.ps1](Install.ps1) | **一行 bootstrap 安装器**：从 GitHub 拉取所选 profile + CLEAN_ALL，落到 `C:\ProgramData\KazuhaHub\`，校验并启动菜单。 |
 | [ORG_PUBLIC_ALL.ps1](ORG_PUBLIC_ALL.ps1) | 公共/共享设备策略：20 分钟空闲注销，更短电源超时，盖上即注销，8 天用户配置文件清理。 |
 | [ORG_LIMITED_USERS.ps1](ORG_LIMITED_USERS.ps1) | 个人受限用户设备策略：2 小时空闲注销，较宽松电源超时，盖上即注销。 |
 | [CLEAN_ALL.ps1](CLEAN_ALL.ps1) | 撤销上述两个脚本写入的所有策略 + 自动更新任务。 |
 
-## 快速使用
+## 一行安装（推荐）
 
-以 **管理员身份** 打开 PowerShell（推荐 PowerShell 7+），切换到本目录后跑脚本，默认进入交互菜单：
+最快的方式 —— **以管理员身份打开 PowerShell**，跑：
+
+```powershell
+iex (irm 'https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/windows/Install.ps1')
+```
+
+会出现菜单让你选 Public / Limited / Cleanup / Quit。选完后 bootstrap 会下载所选 ORG 脚本（连同 CLEAN_ALL）到 `C:\ProgramData\KazuhaHub\`，做 PowerShell parse 校验，把 Owner 强制改成 `BUILTIN\Administrators`（让所有权校验通过），然后跑选中的脚本进入它自己的菜单。
+
+跳过菜单、自动化部署：
+
+```powershell
+# 公共设备 - 应用并跳过重启提问
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/windows/Install.ps1'))) -Profile Public -Unattended
+
+# 个人受限设备
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/windows/Install.ps1'))) -Profile Limited -Unattended
+
+# 清理
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/windows/Install.ps1'))) -Profile Cleanup -Unattended
+```
+
+`-Profile` 可选值：`Public` / `Limited` / `Cleanup`。bootstrap 会同时拉 CLEAN_ALL.ps1，所以将来菜单选 "Uninstall" 时不需要再下载。
+
+## 离线 / 手动使用
+
+如果不能在线拉，也可以把整个 `windows/` 目录拷到机器上，**以管理员身份** 打开 PowerShell 后直接跑：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
