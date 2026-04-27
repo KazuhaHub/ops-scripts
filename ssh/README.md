@@ -91,14 +91,14 @@ sudo ./install-duo-ssh.sh --install-shortcut
 sudo kh-duo
 ```
 
-检查脚本版本：
+检查脚本版本（v1.1.1 起 `--version` 和 `--check-update` 不需要 root）：
 
 ```bash
-sudo ./install-duo-ssh.sh --version
-sudo ./install-duo-ssh.sh --check-update
+./install-duo-ssh.sh --version
+./install-duo-ssh.sh --check-update
 ```
 
-自更新脚本：
+自更新脚本（写 `$SCRIPT_PATH`，需要 root）：
 
 ```bash
 sudo ./install-duo-ssh.sh --self-update
@@ -110,11 +110,16 @@ sudo ./install-duo-ssh.sh --self-update
 https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh
 ```
 
-如需使用 fork 或内部镜像，可以覆盖更新源：
+`KH_DUO_UPDATE_URL` 必须以 `https://raw.githubusercontent.com/` 开头，否则脚本会在任何网络 I/O 之前直接拒绝。这是为了防止通过 `sudo -E` 或 sudoers `env_keep` 让普通用户重定向 self-update 到攻击者控制的 URL：
 
 ```bash
-sudo KH_DUO_UPDATE_URL=https://example.com/install-duo-ssh.sh \
+# 允许：fork 在 GitHub 上的镜像
+sudo KH_DUO_UPDATE_URL=https://raw.githubusercontent.com/myfork/ops-scripts/master/ssh/install-duo-ssh.sh \
      ./install-duo-ssh.sh --self-update
+
+# 拒绝：任何非 raw.githubusercontent.com 的源
+sudo KH_DUO_UPDATE_URL=https://example.com/x.sh ./install-duo-ssh.sh --self-update
+# → [x] Refusing untrusted update URL ...
 ```
 
 ### 卸载
@@ -141,6 +146,19 @@ sudo ./install-duo-ssh.sh --uninstall
 - 首次安装时保留一个已登录的 SSH 会话。
 - 推荐配置一个受控的 `--breakglass` 用户，用于 Duo 服务异常时的紧急恢复。
 - 对生产服务器执行前，先在测试机验证登录流程。
+
+### v1.1.1 起的越权加固
+
+普通用户没法直接跑这个脚本（`require_root` 拦截），但如果通过 `sudo -E` 或 sudoers `env_keep` 让 env 透传，仍可能被利用。v1.1.1 加了这些防御：
+
+- **PATH 固定**为 `/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk 等命令不会被攻击者放在 `$HOME/bin/` 的同名脚本劫持。
+- **`KH_DUO_UPDATE_URL` 白名单**：必须以 `https://raw.githubusercontent.com/` 开头，否则在任何网络 I/O 之前拒绝。
+- **`KH_DUO_SHORTCUT` 白名单**：只允许 `/usr/local/{bin,sbin}/` 和 `/usr/{bin,sbin}/`，防止把 symlink 投到 `/etc/cron.hourly/` 之类的自动执行路径。
+- **`$SCRIPT_PATH` 必须 root-owned** 才允许 `--self-update` 和 `--install-shortcut`。否则把脚本放到 `/home/<user>/` 再 sudo 调用，等于把后续 `sudo kh-duo` 引向用户可写的目标。
+- **`--check-update` 不再需要 root**：纯只读，UX 改善的同时不增加风险。
+- **`--version` / `--help`** 也不需要 root（一直如此）。
+
+如果你的 sudoers 里没有 `Defaults env_keep += "..."`，并且团队不用 `sudo -E` 跑这个脚本，上述风险面其实很小；这些加固是 defense-in-depth。
 
 ### 开发
 

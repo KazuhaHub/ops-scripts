@@ -31,14 +31,16 @@
 #
 # Maintenance:
 #   sudo ./install-duo-ssh.sh --install-shortcut       # create /usr/local/bin/kh-duo → this script
-#   sudo ./install-duo-ssh.sh --check-update           # compare local SCRIPT_VERSION to upstream
+#        ./install-duo-ssh.sh --check-update           # read-only, no root required
 #   sudo ./install-duo-ssh.sh --self-update            # download latest from GitHub and replace
-#   sudo ./install-duo-ssh.sh --version                # print version and exit
+#        ./install-duo-ssh.sh --version                # print version and exit (no root)
 #
 # Env vars:
 #   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
-#   KH_DUO_UPDATE_URL                override upstream raw URL (forks / mirrors)
-#   KH_DUO_SHORTCUT                  override shortcut path (default /usr/local/bin/kh-duo)
+#   KH_DUO_UPDATE_URL                override upstream raw URL — must start with
+#                                    https://raw.githubusercontent.com/  (refused otherwise)
+#   KH_DUO_SHORTCUT                  override shortcut path (must be under
+#                                    /usr/local/{bin,sbin}/ or /usr/{bin,sbin}/)
 #
 # Modes:
 #   - No flags + TTY            → interactive menu (install / uninstall / update / shortcut)
@@ -48,6 +50,13 @@
 # Safe to re-run: idempotent, creates timestamped backups, rolls back on error.
 
 set -euo pipefail
+
+### ─── Hardening ──────────────────────────────────────────────────────────
+# Pin PATH so that bare command names (curl, awk, install, …) cannot be
+# hijacked by an attacker-controlled PATH leaking through `sudo -E` or a
+# sudoers `Defaults env_keep += "PATH"` rule.
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
 ### ─── Defaults / args ────────────────────────────────────────────────────
 IKEY="${DUO_IKEY:-}"
@@ -71,8 +80,12 @@ BACKUP_DIR="/root/duo-install-backup-${TS}"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 # Self-update / shortcut — both URL and path can be overridden via env var
-# (useful for forks, internal mirrors, or non-standard PATH layouts).
-SCRIPT_VERSION="1.1.0"
+# (useful for forks, internal mirrors, or non-standard PATH layouts), but the
+# overrides are validated below so an attacker who can leak env through sudo
+# cannot redirect self-update to an arbitrary host or place the shortcut in
+# a sensitive location.
+SCRIPT_VERSION="1.1.1"
+SCRIPT_TRUSTED_URL_PREFIX="https://raw.githubusercontent.com/"
 SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
 
@@ -143,6 +156,29 @@ ver_lt() {
     [[ "$lower" == "$1" ]]
 }
 
+# Refuse update URLs that don't sit under the trusted prefix.  Without this an
+# attacker who can pass env through sudo (e.g. `sudo -E KH_DUO_UPDATE_URL=...`)
+# could redirect --self-update to a host they control and get root to install
+# arbitrary code into $SCRIPT_PATH.
+validate_update_url() {
+    case "$SCRIPT_RAW_URL" in
+        "$SCRIPT_TRUSTED_URL_PREFIX"*) ;;
+        *) die "Refusing untrusted update URL '$SCRIPT_RAW_URL' — must start with $SCRIPT_TRUSTED_URL_PREFIX" ;;
+    esac
+}
+
+# self_update / install_shortcut both treat $SCRIPT_PATH as trusted.  If the
+# script lives in a directory the caller can write to (e.g. /home/<user>/),
+# they could swap the file under us between root invocations.  Refuse to run
+# privileged operations unless the on-disk script is root-owned.
+require_root_owned_script() {
+    local owner=""
+    owner="$(stat -c '%U' "$SCRIPT_PATH" 2>/dev/null || true)"
+    if [[ "$owner" != "root" ]]; then
+        die "Refusing privileged operation: $SCRIPT_PATH is owned by '${owner:-unknown}', not root. Move it to a root-owned location (e.g. /usr/local/sbin/install-duo-ssh.sh) and re-run."
+    fi
+}
+
 # Echoes the SCRIPT_VERSION value found in the upstream file.  Empty/non-zero
 # return means the network or parse failed — caller decides what to do.
 fetch_remote_version() {
@@ -163,6 +199,8 @@ fetch_remote_version() {
 # the running script.  Backup of the previous version is kept alongside.
 self_update() {
     command -v curl >/dev/null 2>&1 || die "curl is required for self-update"
+    require_root_owned_script    # refuse to update a script in a user-writable dir
+    validate_update_url          # belt-and-braces: URL was already validated in main
     log "Downloading $SCRIPT_RAW_URL ..."
     local tmp
     tmp="$(mktemp)" || die "mktemp failed"
@@ -190,6 +228,16 @@ self_update() {
 # Creates /usr/local/bin/kh-duo (or $KH_DUO_SHORTCUT) → $SCRIPT_PATH.
 install_shortcut() {
     [[ -f "$SCRIPT_PATH" ]] || die "Cannot find script at '$SCRIPT_PATH'"
+    require_root_owned_script    # otherwise sudo kh-duo would later run a user-owned target
+
+    # Whitelist shortcut destinations.  An attacker leaking KH_DUO_SHORTCUT
+    # through sudo could otherwise drop a symlink into /etc/cron.hourly/,
+    # /etc/init.d/, or any other auto-execution path.
+    case "$SHORTCUT_PATH" in
+        /usr/local/bin/*|/usr/local/sbin/*|/usr/bin/*|/usr/sbin/*) ;;
+        *) die "Refusing shortcut path '$SHORTCUT_PATH' — must be under /usr/local/{bin,sbin}/ or /usr/{bin,sbin}/" ;;
+    esac
+
     case "$SCRIPT_PATH" in
         /tmp/*|/var/tmp/*)
             warn "Script lives at $SCRIPT_PATH — temp filesystems may be cleared on reboot,"
@@ -985,11 +1033,14 @@ fix_selinux() {
 }
 
 ### ─── Main ───────────────────────────────────────────────────────────────
-require_root
-detect_os
 
-# Quick-exit action flags — these don't touch SSH/PAM at all, so they bypass
-# the heavier ensure_python3 / install / patch path entirely.
+# Validate trusted env input before doing ANYTHING else (root or not).  This
+# fails closed on the most dangerous override before any network I/O.
+validate_update_url
+
+# --check-update is read-only — no system state is touched, only a curl + awk
+# of the upstream version field.  Run it without requiring root so users can
+# tell whether an update is available before bothering with sudo.
 if [[ $ACTION_CHECK_UPDATE -eq 1 ]]; then
     log "Local version: $SCRIPT_VERSION"
     log "Checking $SCRIPT_RAW_URL ..."
@@ -999,10 +1050,16 @@ if [[ $ACTION_CHECK_UPDATE -eq 1 ]]; then
     elif ver_lt "$remote_ver" "$SCRIPT_VERSION"; then
         ok "Local $SCRIPT_VERSION is ahead of upstream $remote_ver (development build)"
     else
-        warn "Update available: $SCRIPT_VERSION → $remote_ver  (run --self-update to apply)"
+        warn "Update available: $SCRIPT_VERSION → $remote_ver  (run sudo --self-update to apply)"
     fi
     exit 0
 fi
+
+require_root
+detect_os
+
+# Remaining quick-exit actions touch the filesystem as root, so they sit
+# after require_root.  Each one re-validates its preconditions internally.
 if [[ $ACTION_SELF_UPDATE -eq 1 ]]; then
     self_update
     ok "Done. Re-run: sudo $SCRIPT_PATH"
