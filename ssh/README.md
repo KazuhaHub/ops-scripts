@@ -4,7 +4,35 @@ Linux 服务器 SSH 加固相关脚本。
 
 | Script | Description |
 | --- | --- |
+| [install.sh](install.sh) | **一行 bootstrap 安装器**：从 GitHub 拉取并安装 `install-duo-ssh.sh` 到 `/usr/local/sbin/`，可选择直接转发参数完成安装。 |
 | [install-duo-ssh.sh](install-duo-ssh.sh) | 一键安装、配置、卸载和更新 Duo SSH 2FA。 |
+
+## 一行安装（推荐）
+
+最快的方式：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install.sh | sudo bash
+```
+
+bootstrap 会下载 `install-duo-ssh.sh` 到 `/usr/local/sbin/`、做 `bash -n` 校验、安装 `kh-duo` 快捷方式。安装完后跑 `sudo kh-duo` 进交互菜单。
+
+**完全自动化部署**（适合 Ansible / cloud-init / MDM）—— 把 Duo 凭据通过 `--` 转发给主脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install.sh \
+  | sudo bash -s -- \
+      --ikey DIXXXXXXXXXXXXXXXXXX \
+      --skey your-secret-key \
+      --host api-xxxxxxxx.duosecurity.com \
+      --yes
+```
+
+bootstrap 会下载、安装、然后 `exec` 主脚本，把 `--` 之后的所有参数转发过去，一气呵成。
+
+> ⚠️ `curl ... | sudo bash` 的 stdin 是 pipe 不是 TTY，所以**主脚本的菜单不会自动触发**（它要 `[[ -t 0 && -t 1 ]]`）。这是为啥不传参数时 bootstrap 装好就退出，让你下次单独跑 `sudo kh-duo`。
+
+`KH_DUO_BOOTSTRAP_URL` 环境变量可以覆盖下载源，但必须以 `https://raw.githubusercontent.com/` 开头，否则拒绝。
 
 ## install-duo-ssh.sh
 
