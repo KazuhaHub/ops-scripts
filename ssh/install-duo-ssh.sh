@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1174,12 +1174,20 @@ EOF
 }
 
 interactive_menu() {
+    local _ch _ch_label
+    _ch="$(get_effective_channel)"
+    case "$_ch" in
+        beta)   _ch_label=$'\033[1;33mbeta\033[0m' ;;   # warn-color: beta = soak-test, careful
+        stable) _ch_label="stable" ;;
+        *)      _ch_label="$_ch" ;;
+    esac
+
     cat <<BANNER
 
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║         Duo 2FA for SSH — Interactive Setup                           ║
 ╚═══════════════════════════════════════════════════════════════════════╝
-  install-duo-ssh.sh v${SCRIPT_VERSION}   (use --no-menu or any flag to skip the wizard)
+  install-duo-ssh.sh v${SCRIPT_VERSION}  •  channel: ${_ch_label}   (use --no-menu or any flag to skip the wizard)
 BANNER
 
     while true; do
