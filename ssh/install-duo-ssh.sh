@@ -45,6 +45,9 @@
 #   sudo ./install-duo-ssh.sh --install-auto-update    # register daily 04:00 systemd timer (cron fallback)
 #   sudo ./install-duo-ssh.sh --remove-auto-update     # remove the timer / cron entry
 #   sudo ./install-duo-ssh.sh --no-auto-update         # don't auto-register the timer during install
+#   sudo ./install-duo-ssh.sh --reinstall              # full uninstall + reinstall, keeping
+#                                                        existing creds (forces baseline reapply
+#                                                        of PAM / sshd / Duo config)
 #
 # Env vars:
 #   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
@@ -58,6 +61,9 @@
 #                                    trust for hosts that cannot reach canonical).
 #   KH_DUO_SHORTCUT                  override shortcut path (must be under
 #                                    /usr/local/{bin,sbin}/ or /usr/{bin,sbin}/)
+#   KH_DUO_BACKUP_KEEP               number of /root/duo-install-backup-* dirs and
+#                                    .bak.<TS> script files to keep (default 5;
+#                                    0 disables auto-cleanup).
 #
 # Modes:
 #   - No flags + TTY            → interactive menu (install / uninstall / update / shortcut)
@@ -100,8 +106,14 @@ ACTION_USE_CDN=0
 ACTION_SHOW_CONFIG=0
 ACTION_INSTALL_AUTO_UPDATE=0
 ACTION_REMOVE_AUTO_UPDATE=0
+ACTION_REINSTALL=0
 SET_MIRROR_URL=""
 SET_CHANNEL_VALUE=""
+
+# Auto-cleanup retention.  After each successful install / self-update we keep
+# the N most recent backup artifacts and drop older ones.  Override via env
+# KH_DUO_BACKUP_KEEP=N (0 disables cleanup; 20 keeps longer rollback history).
+BACKUP_RETENTION_COUNT="${KH_DUO_BACKUP_KEEP:-5}"
 USE_CDN_PROVIDER=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -113,7 +125,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -218,6 +230,7 @@ while [[ $# -gt 0 ]]; do
         --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
         --set-channel)  ACTION_SET_CHANNEL=1; SET_CHANNEL_VALUE="$2"; shift 2 ;;
         --use-cdn)      ACTION_USE_CDN=1; USE_CDN_PROVIDER="${2:-}"; shift 2 ;;
+        --reinstall)    ACTION_REINSTALL=1; shift ;;
         --show-config)  ACTION_SHOW_CONFIG=1; shift ;;
         --install-auto-update) ACTION_INSTALL_AUTO_UPDATE=1; shift ;;
         --remove-auto-update)  ACTION_REMOVE_AUTO_UPDATE=1; shift ;;
@@ -717,6 +730,9 @@ self_update() {
             warn "Auto-update task refresh failed; run 'sudo kh-duo --remove-auto-update && sudo kh-duo --install-auto-update' to recover"
         fi
     fi
+
+    # Trim old script .bak.* files (keep newest N — see BACKUP_RETENTION_COUNT).
+    cleanup_old_backups "${SCRIPT_PATH}.bak.*" file
 
     log "Re-run to load the new code: sudo $SCRIPT_PATH"
 }
@@ -1575,6 +1591,48 @@ rollback() {
     warn "Rolled back. Original config restored."
 }
 
+# Trim old backup artifacts, keeping the N most recent (by name — our
+# backups all carry a YYYYMMDD-HHMMSS suffix so lexical sort = chronological).
+# Called after a SUCCESSFUL install / self-update so we never delete the
+# safety net for the operation that just ran.
+#   $1 — glob pattern (must match the YYYYMMDD-HHMMSS-suffixed artifacts)
+#   $2 — operand: file | dir
+cleanup_old_backups() {
+    local pattern="$1"
+    local kind="$2"
+    local keep="$BACKUP_RETENTION_COUNT"
+
+    [[ "$keep" =~ ^[0-9]+$ ]] || keep=5
+    (( keep <= 0 )) && return 0   # 0 disables cleanup
+
+    # Collect matching paths via shell glob (no eval — pattern is a literal).
+    local matches=()
+    case "$kind" in
+        dir)
+            while IFS= read -r -d '' d; do
+                matches+=("$d")
+            done < <(find "$(dirname "$pattern")" -maxdepth 1 -type d -name "$(basename "$pattern")" -print0 2>/dev/null | sort -z)
+            ;;
+        file)
+            while IFS= read -r -d '' f; do
+                matches+=("$f")
+            done < <(find "$(dirname "$pattern")" -maxdepth 1 -type f -name "$(basename "$pattern")" -print0 2>/dev/null | sort -z)
+            ;;
+        *) return 0 ;;
+    esac
+
+    local total="${#matches[@]}"
+    (( total > keep )) || return 0
+
+    local trim=$(( total - keep ))
+    local i removed=0
+    for (( i=0; i<trim; i++ )); do
+        rm -rf "${matches[$i]}" 2>/dev/null && (( removed++ ))
+    done
+    (( removed > 0 )) && log "Backup cleanup: removed $removed old artifact(s) ($pattern), keeping $keep most recent"
+    return 0
+}
+
 ### ─── Helpers ───────────────────────────────────────────────────────────
 find_pam_duo_so() {
     local candidates=(
@@ -2339,6 +2397,49 @@ if [[ $ACTION_REMOVE_AUTO_UPDATE -eq 1 ]]; then
     exit 0
 fi
 
+# --reinstall: read existing creds + toggles, full uninstall (in subshell so
+# its exit doesn't kill us), then exec self with the saved state to redo a
+# clean install.  Use case: force a baseline reapply of PAM/sshd config from
+# the latest script's templates without writing version-targeted patches for
+# every config change.
+if [[ $ACTION_REINSTALL -eq 1 ]]; then
+    require_root_owned_script
+    read_existing_config
+    if [[ -z "$IKEY" || -z "$SKEY" || -z "$HOST" ]]; then
+        die "Cannot --reinstall: no existing Duo credentials at $PAM_DUO_CONF.  Run a fresh install with --ikey/--skey/--host instead."
+    fi
+
+    log "Reinstall: snapshot existing config, uninstall, re-apply"
+    log "  ikey=${IKEY:0:8}…  host=$HOST  channel=$(get_effective_channel)"
+
+    saved_ikey="$IKEY"
+    saved_skey="$SKEY"
+    saved_host="$HOST"
+    saved_allow="$ALLOW_PASSWORD"
+    saved_bypass_local="$BYPASS_LOCAL"
+    saved_bypass_addrs="$BYPASS_ADDRS"
+    saved_breakglass="$BREAKGLASS_USER"
+
+    log "Phase 1/2: uninstalling..."
+    # do_uninstall ends with exit 0; subshell isolates that so we can continue.
+    ( UNINSTALL=1 ASSUME_YES=1 do_uninstall ) || die "Uninstall phase failed"
+
+    log "Phase 2/2: reinstalling with saved configuration..."
+    reinstall_args=(
+        --ikey "$saved_ikey"
+        --skey "$saved_skey"
+        --host "$saved_host"
+        --yes
+        --no-menu
+    )
+    [[ $saved_allow -eq 1 ]]            && reinstall_args+=(--allow-password)
+    [[ $saved_bypass_local -eq 0 ]]     && reinstall_args+=(--no-bypass-local)
+    [[ -n "$saved_bypass_addrs" ]]      && reinstall_args+=(--bypass-addr "$saved_bypass_addrs")
+    [[ -n "$saved_breakglass" ]]        && reinstall_args+=(--breakglass "$saved_breakglass")
+
+    exec "$SCRIPT_PATH" "${reinstall_args[@]}"
+fi
+
 ensure_python3
 
 if menu_should_run; then
@@ -2443,6 +2544,9 @@ STATE="$(sshd_service_state)"
 ok "SSH is $STATE"
 
 trap - ERR
+
+### 8.4. Trim old install backup directories (keep newest BACKUP_RETENTION_COUNT)
+cleanup_old_backups "/root/duo-install-backup-*" dir
 
 ### 8.5. Auto-update task — register if not opted out
 if [[ $NO_AUTO_UPDATE -eq 1 ]]; then
