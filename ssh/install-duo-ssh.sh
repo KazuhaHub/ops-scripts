@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.9"
+SCRIPT_VERSION="1.7.0"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -2147,31 +2147,96 @@ fix_selinux() {
     fi
 }
 
-### ─── Self-heal vestigial state from older releases ──────────────────────
-# Hosts that ran install on v1.5.0-v1.6.6 hit the SIGPIPE bug in
-# install_auto_update_systemd's verify and ended up with BOTH a working
-# systemd timer AND a /etc/cron.d/kh-duo-update file (the duplicate
-# fallback).  Both fire daily at 04:00, doubling --update load.
+### ─── Migration patches (version-targeted) ──────────────────────────────
+# One-shot fixes for vestigial state left by past bugs.  Each patch is named
+# patch_<introduced_version>_<short_label> and registered in MIGRATION_PATCHES
+# in version order.
 #
-# v1.6.7 fixed the bug for FUTURE installs but couldn't clean up hosts
-# already in this state.  Add idempotent cleanup here that runs at the
-# start of every kh-duo invocation: when systemd is the active path AND
-# a cron leftover exists, remove the cron file.  Once removed, condition
-# no longer triggers — no-op on subsequent runs.
+# Runtime model:
+#   1. /var/lib/install-duo-ssh/last_applied records the last-applied version.
+#   2. On every root invocation we compute the gap (last_applied, current].
+#   3. Any patch whose target version sits in that gap runs once, then the
+#      file is updated to the current version so subsequent invocations skip.
 #
-# Guarded by EUID check because non-root --version / --check-update /
-# --show-config invocations can't (and shouldn't try to) modify /etc/.
-self_heal_state() {
-    [[ $EUID -eq 0 ]] || return 0
-    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]] \
-       && [[ -f "$AUTO_UPDATE_CRON_FILE" ]] \
-       && command -v systemctl >/dev/null 2>&1 \
-       && systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1; then
-        rm -f "$AUTO_UPDATE_CRON_FILE"
-        log "Self-heal: removed vestigial cron auto-update entry (systemd timer is the active path; this duplicate came from v1.5.0-v1.6.6 SIGPIPE bug)"
-    fi
+# Each patch ALSO validates its own preconditions before mutating.  Version
+# targeting decides "when to consider running"; the condition check decides
+# "is it safe to actually mutate".  Belt-and-suspenders for fresh installs
+# (which have no residue but whose last_applied also reads as 0.0.0).
+#
+# Removal lifecycle: a patch becomes safe to drop once the fleet has all
+# hosts on a version >= patch.target + a safety margin.  Drop both the
+# function definition and its MIGRATION_PATCHES entry — the runner ignores
+# missing functions silently.
+
+PATCH_STATE_DIR="/var/lib/install-duo-ssh"
+PATCH_STATE_FILE="$PATCH_STATE_DIR/last_applied"
+
+# (target_version function_name) — keep ordered ascending by version.
+MIGRATION_PATCHES=(
+    "1.6.9 patch_1_6_9_dual_task_cleanup"
+)
+
+# patch_1_6_9_dual_task_cleanup
+#   Introduced: v1.6.9
+#   Drop after: fleet on >= 1.6.9 for one --update cycle (target: v2.0)
+#   Fixes:      install_auto_update_systemd SIGPIPE bug in v1.5.0-v1.6.6 left
+#               a duplicate /etc/cron.d/kh-duo-update on hosts where systemd
+#               actually worked.  Both fired daily, doubling --update load.
+patch_1_6_9_dual_task_cleanup() {
+    [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]] || return 0
+    [[ -f "$AUTO_UPDATE_CRON_FILE" ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1 || return 0
+    rm -f "$AUTO_UPDATE_CRON_FILE"
+    log "Patch 1.6.9: removed cron leftover from v1.5.0-v1.6.6 SIGPIPE bug"
 }
-self_heal_state
+
+get_last_applied_version() {
+    [[ -r "$PATCH_STATE_FILE" ]] || { echo "0.0.0"; return; }
+    local v
+    v="$(cat "$PATCH_STATE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$v" ]] && echo "$v" || echo "0.0.0"
+}
+
+set_last_applied_version() {
+    local ver="$1"
+    mkdir -p "$PATCH_STATE_DIR" 2>/dev/null || return
+    chmod 755 "$PATCH_STATE_DIR" 2>/dev/null || true
+    local tmp="$PATCH_STATE_FILE.tmp"
+    printf '%s\n' "$ver" > "$tmp" 2>/dev/null && mv "$tmp" "$PATCH_STATE_FILE" 2>/dev/null
+    chmod 644 "$PATCH_STATE_FILE" 2>/dev/null || true
+}
+
+run_migration_patches() {
+    [[ $EUID -eq 0 ]] || return 0
+    [[ -n "${SCRIPT_VERSION:-}" ]] || return 0
+
+    local last_applied current
+    last_applied="$(get_last_applied_version)"
+    current="$SCRIPT_VERSION"
+
+    # No new versions to apply patches for.
+    if ! ver_lt "$last_applied" "$current"; then
+        return 0
+    fi
+
+    local entry target fn ran_any=0
+    for entry in "${MIGRATION_PATCHES[@]}"; do
+        target="${entry%% *}"
+        fn="${entry##* }"
+
+        # Run if last_applied < target <= current
+        if ver_lt "$last_applied" "$target" && ! ver_lt "$current" "$target"; then
+            if declare -f "$fn" >/dev/null 2>&1; then
+                "$fn" || warn "Migration patch $fn returned non-zero (continuing)"
+                ran_any=1
+            fi
+        fi
+    done
+
+    set_last_applied_version "$current"
+}
+run_migration_patches
 
 ### ─── Main ───────────────────────────────────────────────────────────────
 
