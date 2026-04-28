@@ -277,17 +277,19 @@ update_url = https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/instal
 
 **分层防御模型**：canonical 权威，CDN 仅做后备。
 
+| Tier | Anchor | 行为 | 用途 |
+|---|---|---|---|
+| **1** (authoritative) | `raw.githubusercontent.com/<repo>/<branch>/.../install-duo-ssh.sh.sha256` | 可达即一锤定音：匹配 → 通过；不匹配 → **直接拒绝**（不咨询 CDN） | github 是源头，它的 `.sha256` 就是信任边界 |
+| **2** (fallback quorum) | `cdn.jsdelivr.net` + `cdn.statically.io` | 仅 Tier 1 不可达时启用：所有可达 fallback 必须一致 + 匹配下载内容 | CN 网络封 `raw.github` 的兜底 |
+
 ```
-                ┌──────────────────────────────────────────────────────┐
-  Tier 1   →    │  raw.githubusercontent.com/.../install-duo-ssh.sh.sha256 │
-                │  AUTHORITATIVE — 可达即一锤定音                       │
-                └──────────────────────────────────────────────────────┘
-                           ↓ (canonical 不可达时才往下)
-                ┌──────────────────────────────────────────────────────┐
-  Tier 2   →    │  cdn.jsdelivr.net + cdn.statically.io                │
-                │  CDN fallback quorum — 全部可达 anchor 必须一致      │
-                │  专门解决 CN 网络封 raw.github 的场景                │
-                └──────────────────────────────────────────────────────┘
+        ┌─ Tier 1 ────────────────────────────────────┐
+        │  raw.github  →  AUTHORITATIVE               │   ← 可达即一锤定音
+        └─────────────────────────────────────────────┘
+                           ↓  (仅当 Tier 1 不可达)
+        ┌─ Tier 2 ────────────────────────────────────┐
+        │  jsDelivr  +  Statically  (quorum)          │   ← 都可达且一致才通过
+        └─────────────────────────────────────────────┘
 ```
 
 设计要点：
