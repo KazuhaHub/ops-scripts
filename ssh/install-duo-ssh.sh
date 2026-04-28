@@ -38,6 +38,8 @@
 #        ./install-duo-ssh.sh --show-config            # print effective update URL + auto-update status
 #   sudo ./install-duo-ssh.sh --set-channel <stable|beta>  # pick update channel
 #                                                            (stable = master branch, beta = beta branch)
+#   sudo ./install-duo-ssh.sh --use-cdn <provider>     # one-shot CDN preset: github | jsdelivr | statically
+#                                                        (recommended for CN: --use-cdn jsdelivr)
 #   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL (overrides channel)
 #   sudo ./install-duo-ssh.sh --clear-mirror           # remove persistent mirror, revert to channel default
 #   sudo ./install-duo-ssh.sh --install-auto-update    # register daily 04:00 systemd timer (cron fallback)
@@ -94,11 +96,13 @@ ACTION_INSTALL_SHORTCUT=0
 ACTION_SET_MIRROR=0
 ACTION_CLEAR_MIRROR=0
 ACTION_SET_CHANNEL=0
+ACTION_USE_CDN=0
 ACTION_SHOW_CONFIG=0
 ACTION_INSTALL_AUTO_UPDATE=0
 ACTION_REMOVE_AUTO_UPDATE=0
 SET_MIRROR_URL=""
 SET_CHANNEL_VALUE=""
+USE_CDN_PROVIDER=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/duo-install-backup-${TS}"
@@ -109,19 +113,21 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
 # changes there first, soak-test for a few days, then merge into master so
 # the rest of the fleet picks them up at the next 04:00 cycle.
 #
-# Default download is jsDelivr — a public CDN that mirrors GitHub content,
-# reachable from mainland China where raw.githubusercontent.com is often
-# blocked.  Tampering by the CDN is caught by the multi-anchor SHA256 quorum
-# check in verify_downloaded_file() (see HASH_ANCHORS_* below).
-SCRIPT_STABLE_URL="https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
-SCRIPT_BETA_URL="https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@beta/ssh/install-duo-ssh.sh"
+# Default download is canonical GitHub.  Mainland-China users who can't reach
+# raw.githubusercontent.com can opt into a CDN mirror via `--set-mirror`
+# (jsDelivr / Statically / ghproxy / etc — see README).  Whatever URL the
+# script ends up downloading from, the multi-anchor SHA256 quorum check in
+# verify_downloaded_file() (see HASH_ANCHORS_* below) catches tampering by
+# any single mirror — including the canonical default itself.
+SCRIPT_STABLE_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+SCRIPT_BETA_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh"
 
 # Trust anchors for the .sha256 hash file — fetched from MULTIPLE independent
 # CDNs and required to agree (quorum).  Defeats a compromised single mirror
@@ -197,6 +203,7 @@ while [[ $# -gt 0 ]]; do
         --set-mirror)   ACTION_SET_MIRROR=1; SET_MIRROR_URL="$2"; shift 2 ;;
         --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
         --set-channel)  ACTION_SET_CHANNEL=1; SET_CHANNEL_VALUE="$2"; shift 2 ;;
+        --use-cdn)      ACTION_USE_CDN=1; USE_CDN_PROVIDER="${2:-}"; shift 2 ;;
         --show-config)  ACTION_SHOW_CONFIG=1; shift ;;
         --install-auto-update) ACTION_INSTALL_AUTO_UPDATE=1; shift ;;
         --remove-auto-update)  ACTION_REMOVE_AUTO_UPDATE=1; shift ;;
@@ -270,6 +277,33 @@ channel_url() {
         beta)   echo "$SCRIPT_BETA_URL" ;;
         stable) echo "$SCRIPT_STABLE_URL" ;;
         *)      echo "$SCRIPT_STABLE_URL" ;;
+    esac
+}
+
+# Map (provider, branch) -> full download URL for the script.  Drives
+# `--use-cdn <provider>` shortcut (and the menu picker) so users don't have
+# to know each CDN's path conventions.  Unknown provider returns non-zero.
+#
+# Provider names match what `--use-cdn` accepts.  `github` is special — it
+# represents "use the canonical default" and is implemented as
+# clear_mirror() rather than set_mirror() so users can revert cleanly.
+cdn_url() {
+    local provider="$1" branch="$2"
+    case "$provider" in
+        jsdelivr)
+            echo "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@${branch}/ssh/install-duo-ssh.sh"
+            ;;
+        statically)
+            echo "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/${branch}/ssh/install-duo-ssh.sh"
+            ;;
+        github)
+            # Canonical — no mirror needed.  Caller checks for this name and
+            # routes to clear_mirror() instead of set_mirror().
+            echo "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/${branch}/ssh/install-duo-ssh.sh"
+            ;;
+        *)
+            return 1
+            ;;
     esac
 }
 
@@ -364,6 +398,37 @@ set_mirror() {
     esac
     write_config "$(get_persistent_channel)" "$url"
     ok "Persistent mirror URL set in $SCRIPT_CONFIG_FILE"
+    ok "  $url"
+}
+
+# `--use-cdn <provider>` is a UX shortcut over --set-mirror: it knows the
+# URL templates for each supported CDN provider so the user just names the
+# provider.  The current channel determines the branch (master/beta).
+#
+# Provider 'github' is special — it routes to clear_mirror(), reverting to
+# the canonical default (no persistent mirror).
+use_cdn() {
+    local provider="$1"
+    [[ -n "$provider" ]] || die "use_cdn: empty provider name (try: github | jsdelivr | statically)"
+
+    if [[ "$provider" == "github" ]]; then
+        clear_mirror
+        return 0
+    fi
+
+    local branch
+    case "$(get_persistent_channel)" in
+        beta) branch="beta" ;;
+        *)    branch="master" ;;
+    esac
+
+    local url
+    if ! url="$(cdn_url "$provider" "$branch")"; then
+        die "Unknown CDN provider '$provider'.  Supported: github | jsdelivr | statically"
+    fi
+
+    write_config "$(get_persistent_channel)" "$url"
+    ok "CDN preset applied: $provider  (branch: $branch)"
     ok "  $url"
 }
 
@@ -1213,15 +1278,31 @@ menu_switch_channel() {
 
 menu_prompt_mirror_url() {
     echo
-    echo "  Examples for CN networks:"
-    echo "    https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
-    echo "    https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
-    echo "    https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
+    echo "  Pick a mirror source:"
+    echo "    1) jsDelivr     (recommended for CN — public CDN, mirrors GitHub)"
+    echo "    2) Statically   (alternate CDN, also CN-friendly)"
+    echo "    3) Custom URL   (paste your own — ghproxy / internal mirror / etc.)"
+    echo "    q) Cancel"
     echo
-    local url=""
-    read -r -p "  Mirror URL (https://...): " url
-    [[ -z "$url" ]] && { warn "Empty URL — cancelled."; return 0; }
-    set_mirror "$url"
+    local pick=""
+    read -r -p "  Choice [1]: " pick
+    case "${pick:-1}" in
+        1) use_cdn jsdelivr ;;
+        2) use_cdn statically ;;
+        3)
+            echo
+            echo "  Examples:"
+            echo "    https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+            echo "    https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+            echo
+            local url=""
+            read -r -p "  Mirror URL (https://...): " url
+            [[ -z "$url" ]] && { warn "Empty URL — cancelled."; return 0; }
+            set_mirror "$url"
+            ;;
+        q|Q) ok "Cancelled."; return 0 ;;
+        *)   warn "Invalid choice '$pick' — cancelled."; return 0 ;;
+    esac
 }
 
 menu_toggle_auto_update() {
@@ -1935,6 +2016,10 @@ if [[ $ACTION_CLEAR_MIRROR -eq 1 ]]; then
 fi
 if [[ $ACTION_SET_CHANNEL -eq 1 ]]; then
     set_channel "$SET_CHANNEL_VALUE"
+    exit 0
+fi
+if [[ $ACTION_USE_CDN -eq 1 ]]; then
+    use_cdn "$USE_CDN_PROVIDER"
     exit 0
 fi
 
