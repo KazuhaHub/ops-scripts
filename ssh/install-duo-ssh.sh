@@ -98,7 +98,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 
 # Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
 # (set via `--set-mirror <url>` or by editing the file as root).  See
@@ -312,7 +312,7 @@ fetch_remote_version() {
 self_update() {
     command -v curl >/dev/null 2>&1 || die "curl is required for self-update"
     require_root_owned_script    # refuse to update a script in a user-writable dir
-    validate_update_url          # belt-and-braces: URL was already validated in main
+    resolve_update_url           # belt-and-braces: refresh URL from disk config
     log "Downloading $SCRIPT_RAW_URL ..."
     local tmp
     tmp="$(mktemp)" || die "mktemp failed"
