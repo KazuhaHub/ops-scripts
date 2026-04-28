@@ -230,6 +230,38 @@ sudo ./install-duo-ssh.sh --uninstall
 
 如果配置校验或重启失败，脚本会尝试自动恢复备份并重启 SSH。
 
+### Beta 通道（v1.5.1+）
+
+为了避免 v1.4.x 自更新崩溃那种悲剧波及整个 fleet，仓库分两条分支：
+
+| 分支 | 用途 | 谁在用 |
+|---|---|---|
+| `master` | stable，fleet 默认 | 所有生产服务器 |
+| `beta` | 预览，新版本先在这里 soak | 一台/几台测试机 |
+
+工作流：commit 先进 `beta` → 测试机自动更新到 beta 版本 → 跑几天没问题 → merge 到 `master` → fleet 第二天 04:00 全量更新。
+
+**切换通道（菜单或 flag）：**
+
+```bash
+# 把这台机器切到 beta（持久写到 /etc/duo/install-duo-ssh.conf）
+sudo kh-duo --set-channel beta
+
+# 或在菜单里：sudo kh-duo → 5) Update settings → 1) Switch update channel
+
+# 切回 stable
+sudo kh-duo --set-channel stable
+```
+
+**bootstrap 时直接选 beta：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install.sh \
+  | sudo bash -s -- --channel beta
+```
+
+bootstrap 会从 beta 分支拉脚本 + 持久化 `channel = beta` 到配置文件，之后 `kh-duo --update` 自动跟 beta。
+
 ### 自动更新（v1.5.0+）
 
 每次成功安装后，脚本会自动注册一个每天 **04:00** 跑 `--update --no-menu --yes` 的任务，跟 Windows 那边的 `Kazuha Hub Auto Update` 行为对齐。优先级：

@@ -36,15 +36,18 @@
 #                                                        (--self-update kept as deprecated alias)
 #        ./install-duo-ssh.sh --version                # print version and exit (no root)
 #        ./install-duo-ssh.sh --show-config            # print effective update URL + auto-update status
-#   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL
-#                                                        (root-only file at /etc/duo/install-duo-ssh.conf)
-#   sudo ./install-duo-ssh.sh --clear-mirror           # remove persistent mirror, revert to default
+#   sudo ./install-duo-ssh.sh --set-channel <stable|beta>  # pick update channel
+#                                                            (stable = master branch, beta = beta branch)
+#   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL (overrides channel)
+#   sudo ./install-duo-ssh.sh --clear-mirror           # remove persistent mirror, revert to channel default
 #   sudo ./install-duo-ssh.sh --install-auto-update    # register daily 04:00 systemd timer (cron fallback)
 #   sudo ./install-duo-ssh.sh --remove-auto-update     # remove the timer / cron entry
 #   sudo ./install-duo-ssh.sh --no-auto-update         # don't auto-register the timer during install
 #
 # Env vars:
 #   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
+#   KH_DUO_CHANNEL                   override channel (stable/beta) — IGNORED when
+#                                    invoked via sudo from a non-root caller.
 #   KH_DUO_UPDATE_URL                override update URL — IGNORED when invoked
 #                                    via sudo from a non-root caller (anti-tamper).
 #                                    Use --set-mirror for persistent overrides.
@@ -90,10 +93,12 @@ ACTION_SELF_UPDATE=0
 ACTION_INSTALL_SHORTCUT=0
 ACTION_SET_MIRROR=0
 ACTION_CLEAR_MIRROR=0
+ACTION_SET_CHANNEL=0
 ACTION_SHOW_CONFIG=0
 ACTION_INSTALL_AUTO_UPDATE=0
 ACTION_REMOVE_AUTO_UPDATE=0
 SET_MIRROR_URL=""
+SET_CHANNEL_VALUE=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/duo-install-backup-${TS}"
@@ -104,12 +109,15 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 
-# Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
-# (set via `--set-mirror <url>` or by editing the file as root).  See
-# resolve_update_url() below for the order of trust.
-SCRIPT_DEFAULT_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+# Update channel URLs.  `stable` is the default and what most fleet hosts
+# should track.  `beta` is for hosts willing to validate new releases — push
+# changes there first, soak-test for a few days, then merge into master so
+# the rest of the fleet picks them up at the next 04:00 cycle.
+SCRIPT_STABLE_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+SCRIPT_BETA_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh"
+SCRIPT_DEFAULT_URL="$SCRIPT_STABLE_URL"   # back-compat var name; kept for log messages
 
 # Per-host config file owned by root, mode 600.  Only root can write here, so
 # unprivileged users cannot tamper with the update URL even if they manage to
@@ -167,6 +175,7 @@ while [[ $# -gt 0 ]]; do
         --install-shortcut) ACTION_INSTALL_SHORTCUT=1; shift ;;
         --set-mirror)   ACTION_SET_MIRROR=1; SET_MIRROR_URL="$2"; shift 2 ;;
         --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
+        --set-channel)  ACTION_SET_CHANNEL=1; SET_CHANNEL_VALUE="$2"; shift 2 ;;
         --show-config)  ACTION_SHOW_CONFIG=1; shift ;;
         --install-auto-update) ACTION_INSTALL_AUTO_UPDATE=1; shift ;;
         --remove-auto-update)  ACTION_REMOVE_AUTO_UPDATE=1; shift ;;
@@ -200,51 +209,57 @@ ver_lt() {
     [[ "$lower" == "$1" ]]
 }
 
-# Resolve the URL to use for self-update / version checks.  Order of trust:
-#   1. /etc/duo/install-duo-ssh.conf (`update_url = ...`) — root-owned, mode
-#      600.  Set via `--set-mirror <url>` or by editing the file as root.
-#      Persistent across runs and immune to env-var poisoning, since only
-#      root can write to it.
-#   2. KH_DUO_UPDATE_URL env var — honored ONLY when there is no $SUDO_USER
-#      (i.e., we are running as raw root, not via sudo from an unprivileged
-#      account).  This blocks the `KH_DUO_UPDATE_URL=evil sudo -E kh-duo`
-#      attack where an unprivileged user leaks env to root.
-#   3. SCRIPT_DEFAULT_URL.
-resolve_update_url() {
-    if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
-        local conf_url
-        conf_url="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*update_url[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null)"
-        if [[ -n "$conf_url" ]]; then
-            SCRIPT_RAW_URL="$conf_url"
-            return 0
-        fi
-    fi
+# --- Persistent config helpers -------------------------------------------
+# /etc/duo/install-duo-ssh.conf format (managed by this script):
+#   channel    = stable | beta
+#   update_url = <full URL>     ← optional, overrides channel-derived URL
+#
+# Any unprivileged user can READ the file (just ikey hostname etc, no creds),
+# but only root can WRITE — so an attacker leaking env via `sudo -E` cannot
+# redirect updates here, only through KH_DUO_* vars (which we ignore under
+# sudo, see resolve_update_url).
 
-    if [[ -n "${KH_DUO_UPDATE_URL:-}" ]]; then
-        if [[ -n "${SUDO_USER:-}" ]]; then
-            warn "Ignoring KH_DUO_UPDATE_URL — invoked via sudo (SUDO_USER=$SUDO_USER), so the env var could be supplied by an unprivileged caller."
-            warn "To set a persistent custom URL, run as root:  kh-duo --set-mirror <url>"
-        else
-            SCRIPT_RAW_URL="$KH_DUO_UPDATE_URL"
-            return 0
-        fi
-    fi
-
-    SCRIPT_RAW_URL="$SCRIPT_DEFAULT_URL"
+# Read `channel` from disk config; defaults to "stable" if absent / unreadable.
+get_persistent_channel() {
+    [[ -r "$SCRIPT_CONFIG_FILE" ]] || { echo ""; return; }
+    awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*channel[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null
 }
 
-# Write the URL to the persistent root-owned config file.
-set_mirror() {
-    local url="$1"
-    [[ -n "$url" ]] || die "set_mirror: empty URL"
+# Read explicit `update_url` from disk config (empty if not set).
+get_persistent_url() {
+    [[ -r "$SCRIPT_CONFIG_FILE" ]] || { echo ""; return; }
+    awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*update_url[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null
+}
 
-    case "$url" in
-        https://*) ;;
-        *) die "Refusing non-https URL: $url" ;;
+# Effective channel (config > env > default).  KH_DUO_CHANNEL is ignored when
+# invoked via sudo from a non-root caller (anti-tamper).
+get_effective_channel() {
+    local c
+    c="$(get_persistent_channel)"
+    if [[ -n "$c" ]]; then echo "$c"; return; fi
+    if [[ -n "${KH_DUO_CHANNEL:-}" && -z "${SUDO_USER:-}" ]]; then
+        echo "$KH_DUO_CHANNEL"; return
+    fi
+    echo "stable"
+}
+
+# Map channel name -> default URL.  Unknown name falls back to stable.
+channel_url() {
+    case "$1" in
+        beta)   echo "$SCRIPT_BETA_URL" ;;
+        stable) echo "$SCRIPT_STABLE_URL" ;;
+        *)      echo "$SCRIPT_STABLE_URL" ;;
     esac
+}
+
+# Atomically rewrite /etc/duo/install-duo-ssh.conf with given channel + url.
+# Empty channel arg -> default "stable" (line omitted).  Empty url -> no
+# update_url line.  Caller must already be root.
+write_config() {
+    local channel="$1"
+    local url="$2"
 
     require_root
-
     mkdir -p "$(dirname "$SCRIPT_CONFIG_FILE")"
 
     umask 077
@@ -252,10 +267,15 @@ set_mirror() {
     tmp="$(mktemp)" || die "mktemp failed"
     {
         echo "# Kazuha Hub Duo installer config (managed by install-duo-ssh.sh)"
-        echo "# This file is loaded before each --update / --check-update."
-        echo "# Only root can write here, so unprivileged users cannot redirect updates."
+        echo "# Loaded before each --update / --check-update."
+        echo "# Root-only; unprivileged users cannot redirect updates here."
         echo ""
-        echo "update_url = $url"
+        if [[ -n "$channel" && "$channel" != "stable" ]]; then
+            echo "channel = $channel"
+        fi
+        if [[ -n "$url" ]]; then
+            echo "update_url = $url"
+        fi
     } > "$tmp"
 
     install -m 600 -o root -g root "$tmp" "$SCRIPT_CONFIG_FILE" 2>/dev/null || {
@@ -264,18 +284,85 @@ set_mirror() {
         chown root:root "$SCRIPT_CONFIG_FILE" 2>/dev/null || true
     }
     rm -f "$tmp"
+}
+
+# Resolve the URL for self-update / version checks.  Order of trust:
+#   1. /etc/duo/install-duo-ssh.conf  `update_url = ...`  (highest)
+#      Set via `--set-mirror <url>`. Persistent, root-only.
+#   2. KH_DUO_UPDATE_URL env var, ONLY when not invoked via sudo from a
+#      non-root caller.  Otherwise rejected with a warning.
+#   3. Channel-derived URL (config > env > default "stable").
+resolve_update_url() {
+    local conf_url
+    conf_url="$(get_persistent_url)"
+    if [[ -n "$conf_url" ]]; then
+        SCRIPT_RAW_URL="$conf_url"
+        return 0
+    fi
+
+    if [[ -n "${KH_DUO_UPDATE_URL:-}" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            warn "Ignoring KH_DUO_UPDATE_URL — invoked via sudo (SUDO_USER=$SUDO_USER), so the env var could be supplied by an unprivileged caller."
+            warn "Set a persistent URL with:  sudo kh-duo --set-mirror <url>"
+        else
+            SCRIPT_RAW_URL="$KH_DUO_UPDATE_URL"
+            return 0
+        fi
+    fi
+
+    SCRIPT_RAW_URL="$(channel_url "$(get_effective_channel)")"
+}
+
+# --- Public setters (called from CLI flags + menu) -----------------------
+
+# `--set-channel <stable|beta>` writes the channel to the config; preserves any
+# existing custom mirror URL.
+set_channel() {
+    local channel="$1"
+    case "$channel" in
+        stable|beta) ;;
+        *) die "Unknown channel '$channel' (must be 'stable' or 'beta')" ;;
+    esac
+    write_config "$channel" "$(get_persistent_url)"
+    if [[ "$channel" == "stable" ]]; then
+        ok "Channel set to 'stable'"
+    else
+        ok "Channel set to '$channel'  (URL: $(channel_url "$channel"))"
+        warn "Beta channel pulls from the 'beta' branch — use only on test hosts."
+    fi
+}
+
+# `--set-mirror <url>` writes a custom URL (overrides channel-derived URL);
+# preserves existing channel setting.
+set_mirror() {
+    local url="$1"
+    [[ -n "$url" ]] || die "set_mirror: empty URL"
+    case "$url" in
+        https://*) ;;
+        *) die "Refusing non-https URL: $url" ;;
+    esac
+    write_config "$(get_persistent_channel)" "$url"
     ok "Persistent mirror URL set in $SCRIPT_CONFIG_FILE"
     ok "  $url"
 }
 
+# `--clear-mirror` drops the custom URL, keeps channel.  If channel is also at
+# default ("stable"), the config file is removed entirely for cleanliness.
 clear_mirror() {
     require_root
-    if [[ -f "$SCRIPT_CONFIG_FILE" ]]; then
-        rm -f "$SCRIPT_CONFIG_FILE"
-        ok "Removed $SCRIPT_CONFIG_FILE — reverting to default canonical URL"
-        ok "  $SCRIPT_DEFAULT_URL"
+    local channel
+    channel="$(get_persistent_channel)"
+    if [[ -z "$channel" || "$channel" == "stable" ]]; then
+        if [[ -f "$SCRIPT_CONFIG_FILE" ]]; then
+            rm -f "$SCRIPT_CONFIG_FILE"
+            ok "Removed $SCRIPT_CONFIG_FILE — reverting to default canonical URL on stable channel"
+        else
+            ok "No persistent config to clear (already on default)"
+        fi
     else
-        ok "No persistent mirror config to clear (already on default)"
+        write_config "$channel" ""
+        ok "Cleared custom mirror URL — channel '$channel' default URL will be used"
+        ok "  $(channel_url "$channel")"
     fi
 }
 
@@ -690,14 +777,24 @@ print_config_summary() {
         warn "  No Duo config found at $PAM_DUO_CONF — Duo is not installed yet."
         return
     fi
+    local _ch _url
+    _ch="$(get_effective_channel)"
+    _url="$(get_persistent_url)"
     cat <<EOF
-  ikey:               ${IKEY:0:8}…
-  host:               ${HOST:-(not set)}
-  Auth mode:          $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey OR password+Duo' || echo 'publickey+Duo only')
-  Localhost bypass:   $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
-  Extra bypass:       ${BYPASS_ADDRS:-(none)}
-  Breakglass user:    ${BREAKGLASS_USER:-(none)}
-  Auto-update:        $(auto_update_status)
+  Duo
+    Application key:  ${IKEY:0:8}…
+    API host:         ${HOST:-(not set)}
+
+  Login policy
+    Auth mode:        $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey OR password + Duo' || echo 'publickey + Duo only')
+    Localhost bypass: $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
+    Extra bypass:     ${BYPASS_ADDRS:-(none)}
+    Breakglass user:  ${BREAKGLASS_USER:-(none)}
+
+  Updates
+    Channel:          $_ch
+    Mirror URL:       ${_url:-(none — using $_ch channel URL)}
+    Auto-update task: $(auto_update_status)
 EOF
 }
 
@@ -903,15 +1000,18 @@ BANNER
         cat <<'EOF'
 
 What would you like to do?
-  1) Install / configure Duo 2FA  (default — full setup with new credentials)
-  2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
-  3) Show current configuration
-  4) Check for script updates
-  5) Set/clear update mirror URL  (for hosts behind GitHub-blocked networks)
-  6) Uninstall Duo 2FA
-  7) Quit without changes
 
+  1) Install / configure              (full setup with new credentials)
+  2) Adjust login policy              (auth, bypass, breakglass)
+  3) Show current configuration
+
+  4) Check for and install updates
+  5) Update settings                  (channel, mirror, auto-update task)
+
+  6) Uninstall Duo 2FA
+  q) Quit
 EOF
+        echo
         local action=""
         read -r -p "Choice [1]: " action
         case "${action:-1}" in
@@ -919,52 +1019,113 @@ EOF
             2)    menu_adjust_settings && return 0 ;;
             3)    show_current_config ;;
             4)    menu_check_and_update ;;
-            5)    menu_set_mirror ;;
+            5)    menu_update_settings ;;
             6)    menu_uninstall_flow; return 0 ;;
-            7)    ok "No changes made."; exit 0 ;;
+            q|Q)  ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
     done
 }
 
-# Sub-menu: set or clear the persistent update mirror URL.
-menu_set_mirror() {
+# Sub-menu: everything related to where/when updates come from.
+menu_update_settings() {
+    while true; do
+        local _ch _url _auto
+        _ch="$(get_effective_channel)"
+        _url="$(get_persistent_url)"
+        _auto="$(auto_update_status)"
+
+        echo
+        log "Update settings"
+        echo "  Channel:          $_ch"
+        echo "  Mirror URL:       ${_url:-(none — using $_ch channel URL)}"
+        echo "  Auto-update task: $_auto"
+        echo
+        local _toggle_label
+        if [[ "$_auto" == "(disabled)" ]]; then
+            _toggle_label="Enable auto-update task   (daily 04:00 via systemd timer / cron)"
+        else
+            _toggle_label="Disable auto-update task  (currently active)"
+        fi
+        cat <<EOF
+  1) Switch update channel  ($_ch -> $([[ "$_ch" == "stable" ]] && echo beta || echo stable))
+  2) Set mirror URL         (override channel default — for CN proxies, internal forks)
+  3) Clear mirror URL       (revert to channel default)
+  4) $_toggle_label
+  5) Check for and install updates
+  q) Back to main menu
+EOF
+        echo
+        local action=""
+        read -r -p "Choice: " action
+        case "$action" in
+            1) menu_switch_channel; resolve_update_url ;;
+            2) menu_prompt_mirror_url; resolve_update_url ;;
+            3) clear_mirror; resolve_update_url ;;
+            4) menu_toggle_auto_update ;;
+            5) menu_check_and_update ;;
+            q|Q) return 0 ;;
+            *)   warn "Invalid choice '$action'" ;;
+        esac
+    done
+}
+
+menu_switch_channel() {
+    local cur target
+    cur="$(get_effective_channel)"
+    if [[ "$cur" == "stable" ]]; then target="beta"; else target="stable"; fi
+
     echo
-    log "Current update URL"
-    echo "  $SCRIPT_RAW_URL"
-    echo
-    if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
-        echo "  (persisted in $SCRIPT_CONFIG_FILE)"
+    if [[ "$target" == "beta" ]]; then
+        warn "Switching to BETA channel"
+        echo "  beta = preview branch, gets new releases first."
+        echo "  Test hosts only — don't use on production fleet until validated."
+        echo "  Effective URL will become:  $SCRIPT_BETA_URL"
     else
-        echo "  (using default — no persistent config)"
+        warn "Switching back to STABLE channel"
+        echo "  Effective URL will become:  $SCRIPT_STABLE_URL"
     fi
     echo
-    echo "  1) Set a new mirror URL (persists in $SCRIPT_CONFIG_FILE, root-only)"
-    echo "  2) Clear mirror (revert to default canonical GitHub URL)"
-    echo "  q) Cancel"
+    if confirm "Persist channel '$target' to $SCRIPT_CONFIG_FILE?"; then
+        set_channel "$target"
+    else
+        ok "Cancelled."
+    fi
+}
+
+menu_prompt_mirror_url() {
     echo
-    local action=""
-    read -r -p "Choice: " action
-    case "$action" in
-        1)
-            local url=""
-            echo "  Examples for CN networks:"
-            echo "    https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
-            echo "    https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
-            echo "    https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
-            echo
-            read -r -p "  Mirror URL (https://...): " url
-            [[ -z "$url" ]] && { warn "Empty URL — cancelled."; return 0; }
-            set_mirror "$url"
-            resolve_update_url   # refresh effective URL for the rest of this run
-            ;;
-        2)
-            clear_mirror
-            resolve_update_url
-            ;;
-        q|Q) ok "No changes." ;;
-        *)   warn "Invalid choice '$action'" ;;
-    esac
+    echo "  Examples for CN networks:"
+    echo "    https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+    echo "    https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+    echo "    https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
+    echo
+    local url=""
+    read -r -p "  Mirror URL (https://...): " url
+    [[ -z "$url" ]] && { warn "Empty URL — cancelled."; return 0; }
+    set_mirror "$url"
+}
+
+menu_toggle_auto_update() {
+    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" || -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+        echo
+        warn "Disabling daily auto-update means this host won't pick up new versions"
+        warn "automatically.  You'll need to run 'sudo kh-duo --update' manually."
+        if confirm "Disable auto-update task?"; then
+            uninstall_auto_update
+        else
+            ok "No change."
+        fi
+    else
+        echo
+        log "Will register a daily 04:00 task running '$SCRIPT_PATH --update --no-menu --yes'"
+        log "(systemd timer if available, cron fallback)."
+        if confirm "Enable auto-update task?"; then
+            install_auto_update
+        else
+            ok "No change."
+        fi
+    fi
 }
 
 ### ─── OS detection ──────────────────────────────────────────────────────
@@ -1591,25 +1752,37 @@ resolve_update_url
 # --show-config: read-only diagnostic (no admin needed)
 if [[ $ACTION_SHOW_CONFIG -eq 1 ]]; then
     echo
-    log "Update URL configuration"
-    echo "  Default:            $SCRIPT_DEFAULT_URL"
+    log "Update configuration"
+    _eff_ch="$(get_effective_channel)"
+    _conf_ch="$(get_persistent_channel)"
+    _conf_url="$(get_persistent_url)"
+    echo "  Channel:            $_eff_ch ${_conf_ch:+(persisted)}"
+    echo "  Channel URLs:"
+    echo "    stable          = $SCRIPT_STABLE_URL"
+    echo "    beta            = $SCRIPT_BETA_URL"
     if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
         echo "  Persistent config:  $SCRIPT_CONFIG_FILE"
-        local conf_url=""
-        conf_url="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*update_url[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null)"
-        echo "    update_url      = ${conf_url:-(none)}"
+        echo "    channel         = ${_conf_ch:-(default = stable)}"
+        echo "    update_url      = ${_conf_url:-(none — using channel URL)}"
     else
-        echo "  Persistent config:  (none — using default or env override)"
+        echo "  Persistent config:  (none)"
     fi
     if [[ -n "${KH_DUO_UPDATE_URL:-}" ]]; then
         if [[ -n "${SUDO_USER:-}" ]]; then
-            echo "  Env override:       KH_DUO_UPDATE_URL=$KH_DUO_UPDATE_URL  (IGNORED — running via sudo)"
+            echo "  Env KH_DUO_UPDATE_URL: $KH_DUO_UPDATE_URL  (IGNORED — running via sudo)"
         else
-            echo "  Env override:       KH_DUO_UPDATE_URL=$KH_DUO_UPDATE_URL"
+            echo "  Env KH_DUO_UPDATE_URL: $KH_DUO_UPDATE_URL"
+        fi
+    fi
+    if [[ -n "${KH_DUO_CHANNEL:-}" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            echo "  Env KH_DUO_CHANNEL:    $KH_DUO_CHANNEL    (IGNORED — running via sudo)"
+        else
+            echo "  Env KH_DUO_CHANNEL:    $KH_DUO_CHANNEL"
         fi
     fi
     echo "  Effective URL:      $SCRIPT_RAW_URL"
-    echo "  Auto-update:        $(auto_update_status)"
+    echo "  Auto-update task:   $(auto_update_status)"
     exit 0
 fi
 
@@ -1640,6 +1813,10 @@ if [[ $ACTION_SET_MIRROR -eq 1 ]]; then
 fi
 if [[ $ACTION_CLEAR_MIRROR -eq 1 ]]; then
     clear_mirror
+    exit 0
+fi
+if [[ $ACTION_SET_CHANNEL -eq 1 ]]; then
+    set_channel "$SET_CHANNEL_VALUE"
     exit 0
 fi
 

@@ -16,6 +16,13 @@
 #                         --host api-xxxxxxxx.duosecurity.com \
 #                         --yes
 #
+#   # Beta channel (preview branch — for test hosts only).  Adds
+#   # --channel beta to the bootstrap; the bootstrap downloads from the
+#   # beta branch and persists the channel so subsequent --update calls
+#   # also stay on beta.
+#   curl -fsSL https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install.sh \
+#       | sudo bash -s -- --channel beta
+#
 # Behavior:
 #   1. Verify root
 #   2. Download install-duo-ssh.sh to /usr/local/sbin/install-duo-ssh.sh
@@ -32,8 +39,30 @@ set -euo pipefail
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
-BOOTSTRAP_VERSION="1.0.0"
-BASE_URL="${KH_DUO_BOOTSTRAP_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh}"
+BOOTSTRAP_VERSION="1.1.0"
+
+# Strip our own --channel <name> from $@ before we forward the rest to
+# install-duo-ssh.sh (which doesn't have a --channel flag of its own; it has
+# --set-channel for persistence).  Default channel is taken from env, then
+# falls back to stable.
+CHANNEL="${KH_DUO_CHANNEL:-stable}"
+FORWARD_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --channel)    CHANNEL="${2:-stable}"; shift 2 ;;
+        --channel=*)  CHANNEL="${1#--channel=}"; shift ;;
+        *)            FORWARD_ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
+
+case "$CHANNEL" in
+    stable) BRANCH="master" ;;
+    beta)   BRANCH="beta" ;;
+    *)      printf '\033[1;31m[x]\033[0m Unknown channel %q (must be stable or beta)\n' "$CHANNEL" >&2; exit 1 ;;
+esac
+
+BASE_URL="${KH_DUO_BOOTSTRAP_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/$BRANCH/ssh}"
 TRUSTED_PREFIX="https://raw.githubusercontent.com/"
 SCRIPT_NAME="install-duo-ssh.sh"
 INSTALL_DIR="/usr/local/sbin"
@@ -95,6 +124,17 @@ if "$TARGET" --install-shortcut --yes >/dev/null 2>&1; then
     ok "Shortcut installed: /usr/local/bin/kh-duo -> $TARGET"
 else
     warn "Could not install kh-duo shortcut (run '$TARGET --install-shortcut' manually)"
+fi
+
+### ─── Persist channel selection ──────────────────────────────────────────
+# If user picked something other than stable, write it into the persistent
+# config so future --update / auto-update tasks honor it.
+if [[ "$CHANNEL" != "stable" ]]; then
+    if "$TARGET" --set-channel "$CHANNEL" >/dev/null 2>&1; then
+        ok "Channel persisted: $CHANNEL"
+    else
+        warn "Failed to persist channel '$CHANNEL' — run 'sudo kh-duo --set-channel $CHANNEL' manually"
+    fi
 fi
 
 ### ─── Hand off ───────────────────────────────────────────────────────────
