@@ -2147,6 +2147,32 @@ fix_selinux() {
     fi
 }
 
+### ─── Self-heal vestigial state from older releases ──────────────────────
+# Hosts that ran install on v1.5.0-v1.6.6 hit the SIGPIPE bug in
+# install_auto_update_systemd's verify and ended up with BOTH a working
+# systemd timer AND a /etc/cron.d/kh-duo-update file (the duplicate
+# fallback).  Both fire daily at 04:00, doubling --update load.
+#
+# v1.6.7 fixed the bug for FUTURE installs but couldn't clean up hosts
+# already in this state.  Add idempotent cleanup here that runs at the
+# start of every kh-duo invocation: when systemd is the active path AND
+# a cron leftover exists, remove the cron file.  Once removed, condition
+# no longer triggers — no-op on subsequent runs.
+#
+# Guarded by EUID check because non-root --version / --check-update /
+# --show-config invocations can't (and shouldn't try to) modify /etc/.
+self_heal_state() {
+    [[ $EUID -eq 0 ]] || return 0
+    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]] \
+       && [[ -f "$AUTO_UPDATE_CRON_FILE" ]] \
+       && command -v systemctl >/dev/null 2>&1 \
+       && systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1; then
+        rm -f "$AUTO_UPDATE_CRON_FILE"
+        log "Self-heal: removed vestigial cron auto-update entry (systemd timer is the active path; this duplicate came from v1.5.0-v1.6.6 SIGPIPE bug)"
+    fi
+}
+self_heal_state
+
 ### ─── Main ───────────────────────────────────────────────────────────────
 
 # Resolve which URL self-update / check-update will use.  Persistent file
