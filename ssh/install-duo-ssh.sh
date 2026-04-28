@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.5"
+SCRIPT_VERSION="1.6.6"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1925,6 +1925,54 @@ PYEOF
 patch_sshd_config() {
     log "Patching $SSHD_CONFIG"
 
+    # ── Strip ANY previously-written Duo block FIRST (idempotent) ──────
+    # Order matters: this MUST run before the directive checks below.  The
+    # legacy strip is anchored to EOF (^# === Duo 2FA for SSH\b.*\Z), so
+    # any line a directive check below appends to the END of the file
+    # would land inside the legacy block and be silently eaten by this
+    # strip.  Repro: re-run on a v1.6.4 host whose stock sshd_config has
+    # no PasswordAuthentication line at all → printf appends it past the
+    # legacy header, then the strip wipes it, and the rewritten Duo block
+    # is left without it.
+    #
+    # Two passes:
+    #
+    #   1. New format (v1.6.5+): everything between "# kh-duo-sshd-begin"
+    #      and "# kh-duo-sshd-end" sentinel comments.  Single regex, robust
+    #      across multiple re-runs.
+    #
+    #   2. Legacy format (≤ v1.6.4): from the first "# === Duo 2FA for SSH"
+    #      header through EOF.  Pre-1.6.5 always *appended* its block at the
+    #      end of the file, so anything from that header onwards was ours.
+    #      This catches the broken-state where re-running the installer
+    #      stacked multiple Match blocks (the bug fixed by v1.6.5 — a stray
+    #      "AuthenticationMethods publickey,keyboard-interactive:pam" line
+    #      ended up nested inside a Match block, only enforcing Duo for
+    #      127.0.0.0/8 connections while leaving the global scope as 'any').
+    python3 - "$SSHD_CONFIG" <<'PYEOF'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+
+# (1) Strip new-format sentinel block (current and future installs)
+text = re.sub(
+    r'(?ms)\n*^# kh-duo-sshd-begin\b.*?^# kh-duo-sshd-end\b[^\n]*\n?',
+    '\n', text)
+
+# (2) Legacy strip: from first "# === Duo 2FA for SSH" header to EOF.
+#     This deletes the v1.6.4-and-earlier appended block, including all
+#     accumulated stale Match blocks left behind by the old broken cleanup.
+text = re.sub(
+    r'(?ms)\n*^# === Duo 2FA for SSH\b.*\Z',
+    '\n', text)
+
+# Tidy: collapse runs of 3+ blank lines down to exactly one
+text = re.sub(r'\n{3,}', '\n\n', text)
+# Ensure file ends with a single newline
+text = text.rstrip() + '\n'
+p.write_text(text)
+PYEOF
+
     # KbdInteractiveAuthentication / ChallengeResponseAuthentication
     if grep -qE '^\s*#?\s*KbdInteractiveAuthentication\b' "$SSHD_CONFIG"; then
         if ! grep -qE '^\s*KbdInteractiveAuthentication\s+yes\b' "$SSHD_CONFIG"; then
@@ -1968,7 +2016,7 @@ patch_sshd_config() {
     if grep -qE '^\s*#?\s*PasswordAuthentication\b' "$SSHD_CONFIG"; then
         sed -i -E "s|^\s*#?\s*PasswordAuthentication\s+.*|PasswordAuthentication $pw_val|" "$SSHD_CONFIG"
     else
-        printf "PasswordAuthentication $pw_val\n" >> "$SSHD_CONFIG"
+        printf 'PasswordAuthentication %s\n' "$pw_val" >> "$SSHD_CONFIG"
     fi
     ok "Set PasswordAuthentication $pw_val (managed by --allow-password)"
 
@@ -1981,45 +2029,6 @@ patch_sshd_config() {
             ok "Disabled ChallengeResponseAuthentication=no in $redhat_conf"
         fi
     fi
-
-    # ── Strip ANY previously-written Duo block (idempotent) ────────────
-    # Two passes:
-    #
-    #   1. New format (v1.6.5+): everything between "# kh-duo-sshd-begin"
-    #      and "# kh-duo-sshd-end" sentinel comments.  Single regex, robust
-    #      across multiple re-runs.
-    #
-    #   2. Legacy format (≤ v1.6.4): from the first "# === Duo 2FA for SSH"
-    #      header through EOF.  Pre-1.6.5 always *appended* its block at the
-    #      end of the file, so anything from that header onwards was ours.
-    #      This catches the broken-state where re-running the installer
-    #      stacked multiple Match blocks (the bug fixed by v1.6.5 — a stray
-    #      "AuthenticationMethods publickey,keyboard-interactive:pam" line
-    #      ended up nested inside a Match block, only enforcing Duo for
-    #      127.0.0.0/8 connections while leaving the global scope as 'any').
-    python3 - "$SSHD_CONFIG" <<'PYEOF'
-import sys, re, pathlib
-p = pathlib.Path(sys.argv[1])
-text = p.read_text()
-
-# (1) Strip new-format sentinel block (current and future installs)
-text = re.sub(
-    r'(?ms)\n*^# kh-duo-sshd-begin\b.*?^# kh-duo-sshd-end\b[^\n]*\n?',
-    '\n', text)
-
-# (2) Legacy strip: from first "# === Duo 2FA for SSH" header to EOF.
-#     This deletes the v1.6.4-and-earlier appended block, including all
-#     accumulated stale Match blocks left behind by the old broken cleanup.
-text = re.sub(
-    r'(?ms)\n*^# === Duo 2FA for SSH\b.*\Z',
-    '\n', text)
-
-# Tidy: collapse runs of 3+ blank lines down to exactly one
-text = re.sub(r'\n{3,}', '\n\n', text)
-# Ensure file ends with a single newline
-text = text.rstrip() + '\n'
-p.write_text(text)
-PYEOF
 
     # ── Write fresh Duo block, fully wrapped in sentinels ──────────────
     # Default:           publickey + Duo (PAM stack = pam_duo only)
