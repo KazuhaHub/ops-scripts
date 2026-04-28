@@ -35,10 +35,13 @@
 #   sudo ./install-duo-ssh.sh --update                 # download latest and replace
 #                                                        (--self-update kept as deprecated alias)
 #        ./install-duo-ssh.sh --version                # print version and exit (no root)
-#        ./install-duo-ssh.sh --show-config            # print effective update URL + sources
+#        ./install-duo-ssh.sh --show-config            # print effective update URL + auto-update status
 #   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL
 #                                                        (root-only file at /etc/duo/install-duo-ssh.conf)
 #   sudo ./install-duo-ssh.sh --clear-mirror           # remove persistent mirror, revert to default
+#   sudo ./install-duo-ssh.sh --install-auto-update    # register daily 04:00 systemd timer (cron fallback)
+#   sudo ./install-duo-ssh.sh --remove-auto-update     # remove the timer / cron entry
+#   sudo ./install-duo-ssh.sh --no-auto-update         # don't auto-register the timer during install
 #
 # Env vars:
 #   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
@@ -78,6 +81,7 @@ ALLOW_PASSWORD=0
 SKIP_KEY_CHECK=0
 STRICT_PUBLICKEY=0
 UNINSTALL=0
+NO_AUTO_UPDATE=0          # set by --no-auto-update to skip the install of the daily timer/cron job
 ASSUME_YES=0
 NO_MENU=0
 INTERACTIVE_FLAGS_USED=0
@@ -87,6 +91,8 @@ ACTION_INSTALL_SHORTCUT=0
 ACTION_SET_MIRROR=0
 ACTION_CLEAR_MIRROR=0
 ACTION_SHOW_CONFIG=0
+ACTION_INSTALL_AUTO_UPDATE=0
+ACTION_REMOVE_AUTO_UPDATE=0
 SET_MIRROR_URL=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -98,7 +104,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.5.0"
 
 # Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
 # (set via `--set-mirror <url>` or by editing the file as root).  See
@@ -112,6 +118,13 @@ SCRIPT_CONFIG_FILE="/etc/duo/install-duo-ssh.conf"
 
 SCRIPT_RAW_URL=""   # set by resolve_update_url() before any URL fetch
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
+
+# Auto-update task — daily check at 04:00, with up to 15 min jitter to spread
+# fleet load.  Tries systemd first, falls back to cron if systemd is absent.
+AUTO_UPDATE_HOUR="04"
+AUTO_UPDATE_SYSTEMD_SERVICE="/etc/systemd/system/kh-duo-update.service"
+AUTO_UPDATE_SYSTEMD_TIMER="/etc/systemd/system/kh-duo-update.timer"
+AUTO_UPDATE_CRON_FILE="/etc/cron.d/kh-duo-update"
 
 # Minimum required Duo Unix version (CA bundle expiry on 2026-04-15 — see docs)
 DUO_MIN_MAJOR=2
@@ -155,6 +168,9 @@ while [[ $# -gt 0 ]]; do
         --set-mirror)   ACTION_SET_MIRROR=1; SET_MIRROR_URL="$2"; shift 2 ;;
         --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
         --show-config)  ACTION_SHOW_CONFIG=1; shift ;;
+        --install-auto-update) ACTION_INSTALL_AUTO_UPDATE=1; shift ;;
+        --remove-auto-update)  ACTION_REMOVE_AUTO_UPDATE=1; shift ;;
+        --no-auto-update)      NO_AUTO_UPDATE=1; shift ;;
         --version|-V)   printf 'install-duo-ssh.sh %s\n' "${SCRIPT_VERSION:-unknown}"; exit 0 ;;
         -y|--yes)       ASSUME_YES=1; shift ;;
         -h|--help)      usage 0 ;;
@@ -376,6 +392,181 @@ install_shortcut() {
     ok "From now on, just run:  sudo $(basename "$SHORTCUT_PATH")"
 }
 
+### ─── Auto-update timer/cron ─────────────────────────────────────────────
+# Goal (mirrors the Windows scheduled task model): every day at 04:00 the
+# host should `kh-duo --update --no-menu --yes` itself.  We try systemd
+# timer first; if systemd is absent (Alpine + OpenRC, BSD jails, very old
+# distros) we fall back to /etc/cron.d.  Verify after install — refuse to
+# claim success if neither sticks.
+
+has_systemd() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
+}
+
+# Returns 0 if a cron daemon is installed AND running (so /etc/cron.d
+# entries will actually fire).  We accept multiple ways to detect this
+# because cron services have inconsistent names across distros.
+has_cron_daemon() {
+    [[ -d /etc/cron.d ]] || return 1
+    if has_systemd; then
+        for svc in cron crond; do
+            systemctl is-active "$svc" >/dev/null 2>&1 && return 0
+        done
+        for svc in cron crond; do
+            systemctl is-enabled "$svc" >/dev/null 2>&1 && return 0
+        done
+    fi
+    if command -v service >/dev/null 2>&1; then
+        for svc in cron crond; do
+            service "$svc" status >/dev/null 2>&1 && return 0
+        done
+    fi
+    pgrep -x cron  >/dev/null 2>&1 && return 0
+    pgrep -x crond >/dev/null 2>&1 && return 0
+    return 1
+}
+
+install_auto_update_systemd() {
+    log "Writing systemd timer for daily auto-update at ${AUTO_UPDATE_HOUR}:00"
+
+    cat > "$AUTO_UPDATE_SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=Kazuha Hub Duo SSH installer auto-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_PATH --update --no-menu --yes
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    cat > "$AUTO_UPDATE_SYSTEMD_TIMER" <<EOF
+[Unit]
+Description=Daily auto-update for Kazuha Hub Duo SSH installer
+
+[Timer]
+OnCalendar=*-*-* ${AUTO_UPDATE_HOUR}:00:00
+Persistent=true
+RandomizedDelaySec=15min
+Unit=kh-duo-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    chmod 644 "$AUTO_UPDATE_SYSTEMD_SERVICE" "$AUTO_UPDATE_SYSTEMD_TIMER"
+
+    systemctl daemon-reload || { warn "systemctl daemon-reload failed"; return 1; }
+    systemctl enable --now kh-duo-update.timer >/dev/null 2>&1 \
+        || { warn "systemctl enable --now kh-duo-update.timer failed"; return 1; }
+
+    # Verify it's actually scheduled
+    if systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1 \
+       && systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
+            | grep -q kh-duo-update; then
+        local nextrun
+        nextrun=$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
+                  | awk '/kh-duo-update/{print $1, $2; exit}')
+        ok "systemd timer enabled  (next run: ${nextrun:-unknown})"
+        return 0
+    fi
+    return 1
+}
+
+install_auto_update_cron() {
+    log "Writing cron entry for daily auto-update at ${AUTO_UPDATE_HOUR}:00"
+
+    # Up to 15 min jitter to spread fleet load.  awk srand() works across
+    # /bin/sh, dash, ash, etc — unlike $RANDOM which is bash-specific.
+    cat > "$AUTO_UPDATE_CRON_FILE" <<EOF
+# Kazuha Hub Duo SSH installer auto-update (managed by install-duo-ssh.sh)
+# Daily at ${AUTO_UPDATE_HOUR}:00 with up to 15 minutes of randomized jitter.
+SHELL=/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+0 ${AUTO_UPDATE_HOUR} * * * root sleep \$(awk 'BEGIN{srand();print int(rand()*900)}'); $SCRIPT_PATH --update --no-menu --yes >/dev/null 2>&1
+EOF
+    chmod 644 "$AUTO_UPDATE_CRON_FILE"
+    chown root:root "$AUTO_UPDATE_CRON_FILE" 2>/dev/null || true
+
+    [[ -f "$AUTO_UPDATE_CRON_FILE" ]] || { err "Failed to write $AUTO_UPDATE_CRON_FILE"; return 1; }
+    ok "Cron entry written: $AUTO_UPDATE_CRON_FILE"
+    return 0
+}
+
+# Public entrypoint — try systemd, fall back to cron, hard-fail if neither.
+install_auto_update() {
+    [[ -n "${SCRIPT_PATH:-}" ]] || die "install_auto_update: SCRIPT_PATH not set"
+
+    log "Setting up daily auto-update (mirrors --update --no-menu --yes)"
+
+    if has_systemd; then
+        if install_auto_update_systemd; then
+            return 0
+        fi
+        warn "systemd timer install failed — falling back to cron"
+    else
+        log "systemd not detected — using cron"
+    fi
+
+    if has_cron_daemon; then
+        if install_auto_update_cron; then
+            ok "cron entry will run daily at ${AUTO_UPDATE_HOUR}:00 (with up to 15m jitter)"
+            return 0
+        fi
+        return 1
+    fi
+
+    err "Could not enable auto-update: no working systemd timer, and no cron daemon detected."
+    err "Schedule '$SCRIPT_PATH --update --no-menu --yes' yourself (Ansible / cron / etc.)"
+    return 1
+}
+
+# Idempotent removal: drops both systemd units and the cron file regardless
+# of which one is currently in use.
+uninstall_auto_update() {
+    local removed=0
+    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" || -f "$AUTO_UPDATE_SYSTEMD_SERVICE" ]]; then
+        if has_systemd; then
+            systemctl disable --now kh-duo-update.timer >/dev/null 2>&1 || true
+        fi
+        rm -f "$AUTO_UPDATE_SYSTEMD_TIMER" "$AUTO_UPDATE_SYSTEMD_SERVICE"
+        if has_systemd; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ok "Removed systemd auto-update timer"
+        removed=1
+    fi
+    if [[ -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+        rm -f "$AUTO_UPDATE_CRON_FILE"
+        ok "Removed cron auto-update entry: $AUTO_UPDATE_CRON_FILE"
+        removed=1
+    fi
+    [[ $removed -eq 0 ]] && log "No auto-update entries to remove"
+    return 0
+}
+
+# One-line status string for show_current_config / final banner.
+auto_update_status() {
+    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]]; then
+        if has_systemd && systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1; then
+            local nextrun
+            nextrun=$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
+                      | awk '/kh-duo-update/{print $1, $2; exit}')
+            printf 'systemd timer (next: %s)' "${nextrun:-unknown}"
+            return
+        fi
+        printf 'systemd timer (file present, NOT enabled)'
+        return
+    fi
+    if [[ -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+        printf 'cron (%s)' "$AUTO_UPDATE_CRON_FILE"
+        return
+    fi
+    printf '(disabled)'
+}
+
 ### ─── Interactive menu ──────────────────────────────────────────────────
 # Triggered when no flags are passed AND stdin is a TTY.  Sets the same
 # globals that the flag parser sets, so the rest of the script doesn't
@@ -506,6 +697,7 @@ print_config_summary() {
   Localhost bypass:   $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
   Extra bypass:       ${BYPASS_ADDRS:-(none)}
   Breakglass user:    ${BREAKGLASS_USER:-(none)}
+  Auto-update:        $(auto_update_status)
 EOF
 }
 
@@ -1160,6 +1352,7 @@ PYEOF
 ### ─── Uninstall path ─────────────────────────────────────────────────────
 do_uninstall() {
     log "Reverting SSH/Duo configuration"
+    uninstall_auto_update
     backup_file "$SSHD_CONFIG"
     backup_file "$PAM_SSHD"
 
@@ -1416,6 +1609,7 @@ if [[ $ACTION_SHOW_CONFIG -eq 1 ]]; then
         fi
     fi
     echo "  Effective URL:      $SCRIPT_RAW_URL"
+    echo "  Auto-update:        $(auto_update_status)"
     exit 0
 fi
 
@@ -1458,6 +1652,14 @@ if [[ $ACTION_SELF_UPDATE -eq 1 ]]; then
 fi
 if [[ $ACTION_INSTALL_SHORTCUT -eq 1 ]]; then
     install_shortcut
+    exit 0
+fi
+if [[ $ACTION_INSTALL_AUTO_UPDATE -eq 1 ]]; then
+    install_auto_update
+    exit 0
+fi
+if [[ $ACTION_REMOVE_AUTO_UPDATE -eq 1 ]]; then
+    uninstall_auto_update
     exit 0
 fi
 
@@ -1565,6 +1767,16 @@ STATE="$(sshd_service_state)"
 ok "SSH is $STATE"
 
 trap - ERR
+
+### 8.5. Auto-update task — register if not opted out
+if [[ $NO_AUTO_UPDATE -eq 1 ]]; then
+    log "Skipping auto-update setup (--no-auto-update)"
+elif [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]] || [[ -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+    # Already configured — just refresh in case the script path changed
+    install_auto_update || warn "Could not refresh auto-update task — existing one still active"
+else
+    install_auto_update || warn "Auto-update setup failed; you'll need to schedule '$SCRIPT_PATH --update --no-menu --yes' yourself"
+fi
 
 ### 9. Final output
 cat <<EOF

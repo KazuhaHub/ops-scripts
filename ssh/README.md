@@ -106,6 +106,9 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--allow-password` | 强制开启 password + Duo fallback（即使有 SSH key）。 |
 | `--strict-publickey` | 强制 publickey-only，没找到 key 时直接 abort（不允许密码登录）。 |
 | `--skip-key-check` | 跳过 authorized_keys 检查。 |
+| `--install-auto-update` | 单独注册每天 04:00 自动更新（systemd timer，cron fallback）。 |
+| `--remove-auto-update` | 移除自动更新任务（systemd 和 cron 两边都清）。 |
+| `--no-auto-update` | 安装时**不要**自动注册更新任务（适合用 Ansible 等外部工具管理）。 |
 | `--uninstall` | 卸载 Duo SSH 2FA 并恢复 SSH 配置。 |
 | `--no-menu` | 即使在 TTY 中也不进入交互菜单。 |
 | `-y`, `--yes` | 自动确认提示，适合自动化执行。 |
@@ -226,6 +229,34 @@ sudo ./install-duo-ssh.sh --uninstall
 ```
 
 如果配置校验或重启失败，脚本会尝试自动恢复备份并重启 SSH。
+
+### 自动更新（v1.5.0+）
+
+每次成功安装后，脚本会自动注册一个每天 **04:00** 跑 `--update --no-menu --yes` 的任务，跟 Windows 那边的 `Kazuha Hub Auto Update` 行为对齐。优先级：
+
+1. **systemd timer** —— 检测到 `systemctl` 时安装 `/etc/systemd/system/kh-duo-update.{timer,service}`，`Persistent=true` + `RandomizedDelaySec=15min`（错过窗口会补跑、最多 15 分钟随机延迟避免 fleet 同时打满 GitHub）
+2. **cron fallback** —— 没 systemd 时写 `/etc/cron.d/kh-duo-update`，跳点 sleep `0–900` 秒再跑，同样的 fleet 错峰目的
+3. **两个都没** —— 报错让用户手动调度
+
+`kh-duo --show-config` 顶部会显示当前用的是哪种、下次什么时候跑。`--uninstall` 会同时清两边（即使一开始用的 systemd，将来切到 cron 后再卸载也能干净）。
+
+控制 flag：
+
+```bash
+sudo kh-duo --install-auto-update    # 单独注册（不重装 Duo 的话）
+sudo kh-duo --remove-auto-update     # 单独移除
+sudo kh-duo --no-auto-update         # 安装 Duo 时跳过注册（外部工具管理时用）
+```
+
+立即触发（不等 04:00）：
+
+```bash
+# systemd
+sudo systemctl start kh-duo-update.service
+
+# cron
+sudo /usr/local/sbin/install-duo-ssh.sh --update --no-menu --yes
+```
 
 ### 登录方式自动检测（v1.4.0+）
 
