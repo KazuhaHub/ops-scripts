@@ -84,7 +84,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_TRUSTED_URL_PREFIX="https://raw.githubusercontent.com/"
 SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
@@ -330,6 +330,138 @@ menu_check_and_update() {
     exit 0
 }
 
+# Read current Duo config from disk into the global vars (IKEY/SKEY/HOST,
+# ALLOW_PASSWORD, BYPASS_LOCAL, BYPASS_ADDRS, BREAKGLASS_USER).  Used by the
+# "Adjust settings" and "Show current config" menu items.  Scopes parsing of
+# Match Address / Match User to the Duo block we wrote, so user-managed
+# unrelated Match blocks elsewhere in sshd_config aren't confused for ours.
+read_existing_config() {
+    if [[ -f "$PAM_DUO_CONF" ]]; then
+        IKEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*ikey[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
+        SKEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*skey[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
+        HOST="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*host[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
+    fi
+
+    if [[ ! -f "$SSHD_CONFIG" ]]; then return 0; fi
+
+    # Slice out only the script-managed block — everything from the marker comment to EOF
+    local duo_block
+    duo_block="$(awk '/^# === Duo 2FA for SSH \(PAM mode/{flag=1} flag' "$SSHD_CONFIG")"
+    [[ -z "$duo_block" ]] && return 0
+
+    if printf '%s\n' "$duo_block" | grep -qE '^[[:space:]]*AuthenticationMethods[[:space:]]+publickey,keyboard-interactive:pam[[:space:]]+keyboard-interactive:pam'; then
+        ALLOW_PASSWORD=1
+    else
+        ALLOW_PASSWORD=0
+    fi
+
+    local addr_line
+    addr_line="$(printf '%s\n' "$duo_block" | awk '/^[[:space:]]*Match Address /{sub(/^[[:space:]]*Match Address /,""); print; exit}')"
+    if [[ -n "$addr_line" ]]; then
+        local addrs="$addr_line"
+        if [[ "$addrs" == 127.0.0.0/8,::1* ]]; then
+            BYPASS_LOCAL=1
+            addrs="${addrs#127.0.0.0/8,::1}"
+            addrs="${addrs#,}"
+        else
+            BYPASS_LOCAL=0
+        fi
+        BYPASS_ADDRS="$addrs"
+    else
+        BYPASS_LOCAL=0
+        BYPASS_ADDRS=""
+    fi
+
+    BREAKGLASS_USER="$(printf '%s\n' "$duo_block" | awk '/^[[:space:]]*Match User /{print $3; exit}')"
+}
+
+# Pretty-print current state. Caller is expected to have called
+# read_existing_config first (or this function will refresh on its own).
+show_current_config() {
+    read_existing_config
+    echo
+    log "Current Duo SSH configuration"
+    if [[ ! -f "$PAM_DUO_CONF" || -z "$IKEY" ]]; then
+        warn "  No Duo config found at $PAM_DUO_CONF — Duo is not installed yet."
+        return
+    fi
+    cat <<EOF
+  ikey:               ${IKEY:0:8}…
+  host:               ${HOST:-(not set)}
+  Auth mode:          $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey OR password+Duo' || echo 'publickey+Duo only')
+  Localhost bypass:   $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
+  Extra bypass:       ${BYPASS_ADDRS:-(none)}
+  Breakglass user:    ${BREAKGLASS_USER:-(none)}
+EOF
+}
+
+# Sub-menu: toggle individual settings without re-asking for credentials.
+# Returns 0 on "Apply" → caller (interactive_menu) returns to main, which then
+# runs the normal install pipeline using the updated globals.  Returns 1 (or
+# exits) if the user cancels.
+menu_adjust_settings() {
+    if [[ ! -f "$PAM_DUO_CONF" ]]; then
+        warn "Cannot adjust settings — no Duo config at $PAM_DUO_CONF."
+        warn "Use option 1 (Install / configure) for first-time setup."
+        return 1
+    fi
+
+    read_existing_config
+
+    if [[ -z "$IKEY" || -z "$SKEY" || -z "$HOST" ]]; then
+        die "Could not read existing Duo credentials from $PAM_DUO_CONF"
+    fi
+
+    while true; do
+        show_current_config
+        echo
+        echo "Adjust which setting?"
+        echo "  1) Toggle password fallback         (currently: $([[ $ALLOW_PASSWORD -eq 1 ]] && echo ON || echo OFF))"
+        echo "  2) Toggle localhost bypass          (currently: $([[ $BYPASS_LOCAL -eq 1 ]] && echo ON || echo OFF))"
+        echo "  3) Set/clear extra bypass CIDRs     (currently: ${BYPASS_ADDRS:-none})"
+        echo "  4) Set/clear breakglass user        (currently: ${BREAKGLASS_USER:-none})"
+        echo "  5) Apply pending changes (re-run install)"
+        echo "  q) Cancel (no changes applied)"
+        echo
+        local action=""
+        read -r -p "Choice: " action
+        case "$action" in
+            1)  ALLOW_PASSWORD=$((1 - ALLOW_PASSWORD));  ok "Password fallback now: $([[ $ALLOW_PASSWORD -eq 1 ]] && echo ON || echo OFF)" ;;
+            2)  BYPASS_LOCAL=$((1 - BYPASS_LOCAL));      ok "Localhost bypass now: $([[ $BYPASS_LOCAL -eq 1 ]] && echo ON || echo OFF)" ;;
+            3)
+                local cidrs=""
+                read -r -p "  Bypass CIDRs (comma-separated, empty to clear): " cidrs
+                BYPASS_ADDRS="$cidrs"
+                ok "Extra bypass CIDRs: ${BYPASS_ADDRS:-(none)}"
+                ;;
+            4)
+                local bg=""
+                read -r -p "  Breakglass username (empty to clear): " bg
+                BREAKGLASS_USER="$bg"
+                ok "Breakglass user: ${BREAKGLASS_USER:-(none)}"
+                ;;
+            5)
+                show_current_config
+                echo
+                # Bypass install_wizard prompts; install pipeline still runs normally.
+                ASSUME_YES=1
+                NO_MENU=1
+                INTERACTIVE_FLAGS_USED=1
+                if confirm "Re-apply with these settings (will restart sshd)?"; then
+                    return 0
+                fi
+                ok "Cancelled."
+                return 1
+                ;;
+            q|Q)
+                ok "No changes applied."
+                exit 0
+                ;;
+            *)  warn "Invalid choice '$action'" ;;
+        esac
+    done
+}
+
 install_wizard() {
     # ── Step 1/5 — credentials ─────────────────────────────────────────
     echo
@@ -424,21 +556,25 @@ BANNER
         cat <<'EOF'
 
 What would you like to do?
-  1) Install / configure Duo 2FA  (default)
-  2) Uninstall Duo 2FA
-  3) Check for script updates
-  4) Install / refresh the 'kh-duo' shortcut
-  5) Quit without changes
+  1) Install / configure Duo 2FA  (default — full setup with new credentials)
+  2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
+  3) Show current configuration
+  4) Uninstall Duo 2FA
+  5) Check for script updates
+  6) Install / refresh the 'kh-duo' shortcut
+  7) Quit without changes
 
 EOF
         local action=""
         read -r -p "Choice [1]: " action
         case "${action:-1}" in
             1|"") install_wizard; return 0 ;;
-            2)    menu_uninstall_flow; return 0 ;;
-            3)    menu_check_and_update ;;
-            4)    install_shortcut ;;
-            5)    ok "No changes made."; exit 0 ;;
+            2)    menu_adjust_settings && return 0 ;;
+            3)    show_current_config ;;
+            4)    menu_uninstall_flow; return 0 ;;
+            5)    menu_check_and_update ;;
+            6)    install_shortcut ;;
+            7)    ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
     done

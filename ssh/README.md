@@ -110,6 +110,32 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `-y`, `--yes` | 自动确认提示，适合自动化执行。 |
 | `-h`, `--help` | 显示帮助。 |
 
+### 交互菜单（v1.2.0+）
+
+直接跑 `sudo kh-duo`（或 `sudo ./install-duo-ssh.sh`）会进交互菜单：
+
+```
+What would you like to do?
+  1) Install / configure Duo 2FA  (default — full setup with new credentials)
+  2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
+  3) Show current configuration
+  4) Uninstall Duo 2FA
+  5) Check for script updates
+  6) Install / refresh the 'kh-duo' shortcut
+  7) Quit without changes
+```
+
+**Adjust settings (选项 2)** 是 v1.2.0 新增的：自动从 `/etc/duo/pam_duo.conf` 和 `/etc/ssh/sshd_config` 的 Duo 块读出当前 ikey/skey/host 和所有开关，让你在不重新输凭据的情况下切换：
+
+- 是否允许 password fallback
+- 是否绕过 localhost
+- 额外的 bypass CIDR（多个用逗号隔开）
+- breakglass user
+
+子菜单里多次切换会先在内存里累积，最后选 "5) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
+
+**Show current configuration (选项 3)** 不动任何东西，只 dump 当前生效的设置（含 ikey 前 8 位脱敏）。
+
 ### 维护命令
 
 安装快捷命令：
