@@ -109,7 +109,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1000,14 +1000,11 @@ BANNER
         cat <<'EOF'
 
 What would you like to do?
-
   1) Install / configure              (full setup with new credentials)
   2) Adjust login policy              (auth, bypass, breakglass)
   3) Show current configuration
-
   4) Check for and install updates
   5) Update settings                  (channel, mirror, auto-update task)
-
   6) Uninstall Duo 2FA
   q) Quit
 EOF
@@ -1973,6 +1970,8 @@ if [[ -n "$BREAKGLASS_USER" ]]; then
 fi
 cat <<EOF
 ║  Backups:            $(printf '%-49s' "$BACKUP_DIR")║
+║  Channel:            $(printf '%-49s' "$(get_effective_channel)")║
+║  Auto-update:        $(printf '%-49s' "$(auto_update_status)")║
 ║                                                                       ║
 ║  DO NOT CLOSE THIS SESSION YET.                                       ║
 ║  Open a NEW terminal and test SSH login first.                        ║
