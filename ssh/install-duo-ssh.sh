@@ -98,7 +98,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 # Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
 # (set via `--set-mirror <url>` or by editing the file as root).  See
@@ -714,11 +714,10 @@ What would you like to do?
   1) Install / configure Duo 2FA  (default — full setup with new credentials)
   2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
   3) Show current configuration
-  4) Uninstall Duo 2FA
-  5) Check for script updates
-  6) Set/clear update mirror URL  (for hosts behind GitHub-blocked networks)
-  7) Install / refresh the 'kh-duo' shortcut
-  8) Quit without changes
+  4) Check for script updates
+  5) Set/clear update mirror URL  (for hosts behind GitHub-blocked networks)
+  6) Uninstall Duo 2FA
+  7) Quit without changes
 
 EOF
         local action=""
@@ -727,11 +726,10 @@ EOF
             1|"") install_wizard; return 0 ;;
             2)    menu_adjust_settings && return 0 ;;
             3)    show_current_config ;;
-            4)    menu_uninstall_flow; return 0 ;;
-            5)    menu_check_and_update ;;
-            6)    menu_set_mirror ;;
-            7)    install_shortcut ;;
-            8)    ok "No changes made."; exit 0 ;;
+            4)    menu_check_and_update ;;
+            5)    menu_set_mirror ;;
+            6)    menu_uninstall_flow; return 0 ;;
+            7)    ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
     done
