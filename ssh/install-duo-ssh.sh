@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.6.4"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -639,10 +639,23 @@ fetch_remote_version() {
 
 # Downloads the upstream script, sanity-checks it, then atomically replaces
 # the running script.  Backup of the previous version is kept alongside.
+#
+# Caller does not need to print further status — this function emits a clear
+# end-state line:
+#   "Already on latest version (X) — no changes"          (no-op)
+#   "Updated X → Y  (backup: …)" + re-run hint             (upgrade)
+#   "Reinstalled X  (content changed without version bump)" + re-run hint
+#   "Downgraded X → Y  (backup: …)" + re-run hint          (warn)
+#
+# The hash short-circuit avoids creating a useless backup every day at 04:00
+# when the cron auto-update runs and finds no new release.
 self_update() {
     command -v curl >/dev/null 2>&1 || die "curl is required for self-update"
     require_root_owned_script    # refuse to update a script in a user-writable dir
     resolve_update_url           # belt-and-braces: refresh URL from disk config
+
+    local old_ver="$SCRIPT_VERSION"
+    log "Local version: $old_ver"
     log "Downloading $SCRIPT_RAW_URL ..."
     local tmp
     tmp="$(mktemp)" || die "mktemp failed"
@@ -656,6 +669,24 @@ self_update() {
         rm -f "$tmp"; die "Downloaded file failed syntax check — refusing to install"
     }
     verify_downloaded_file "$tmp" || { rm -f "$tmp"; die "Anti-tamper verification failed"; }
+
+    # Parse version of the downloaded file (informational; hash compare below
+    # is the source of truth for "is it actually different content?").
+    local new_ver
+    new_ver="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$tmp")"
+    [[ -n "$new_ver" ]] || new_ver="(unknown)"
+
+    # No-op short-circuit: byte-identical content → already on latest, skip
+    # backup + install entirely.  Avoids cron leaving daily *.bak files.
+    local current_hash new_hash
+    current_hash="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
+    new_hash="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ -n "$current_hash" && "$current_hash" == "$new_hash" ]]; then
+        rm -f "$tmp"
+        ok "Already on latest version ($old_ver) — no changes"
+        return 0
+    fi
+
     local backup="${SCRIPT_PATH}.bak.${TS}"
     cp -a "$SCRIPT_PATH" "$backup" || die "Backup of current script failed"
     if ! install -m 755 "$tmp" "$SCRIPT_PATH" 2>/dev/null; then
@@ -665,7 +696,15 @@ self_update() {
         }
     fi
     rm -f "$tmp"
-    ok "Self-update complete (backup: $backup)"
+
+    if [[ "$old_ver" == "$new_ver" ]]; then
+        ok "Reinstalled $new_ver  (script content changed without version bump; backup: $backup)"
+    elif ver_lt "$old_ver" "$new_ver"; then
+        ok "Updated $old_ver → $new_ver  (backup: $backup)"
+    else
+        warn "Downgraded $old_ver → $new_ver  (backup: $backup)"
+    fi
+    log "Re-run to load the new code: sudo $SCRIPT_PATH"
 }
 
 # Creates /usr/local/bin/kh-duo (or $KH_DUO_SHORTCUT) → $SCRIPT_PATH.
@@ -944,7 +983,6 @@ menu_check_and_update() {
     warn "Update available: $SCRIPT_VERSION → $remote (run 'sudo $SCRIPT_PATH --update' to install, or pick the menu option below)"
     confirm "Download and install now?" || { ok "Skipped."; return 0; }
     self_update
-    ok "Re-run the script to use the new version: sudo $SCRIPT_PATH"
     exit 0
 }
 
@@ -2104,7 +2142,6 @@ fi
 # after require_root.  Each one re-validates its preconditions internally.
 if [[ $ACTION_SELF_UPDATE -eq 1 ]]; then
     self_update
-    ok "Done. Re-run: sudo $SCRIPT_PATH"
     exit 0
 fi
 if [[ $ACTION_INSTALL_SHORTCUT -eq 1 ]]; then
