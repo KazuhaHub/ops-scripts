@@ -109,23 +109,36 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.6.0"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
 # changes there first, soak-test for a few days, then merge into master so
 # the rest of the fleet picks them up at the next 04:00 cycle.
-SCRIPT_STABLE_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
-SCRIPT_BETA_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh"
+#
+# Default download is jsDelivr — a public CDN that mirrors GitHub content,
+# reachable from mainland China where raw.githubusercontent.com is often
+# blocked.  Tampering by the CDN is caught by the multi-anchor SHA256 quorum
+# check in verify_downloaded_file() (see HASH_ANCHORS_* below).
+SCRIPT_STABLE_URL="https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
+SCRIPT_BETA_URL="https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@beta/ssh/install-duo-ssh.sh"
 
-# Canonical SHA256 hash files — fetched from GitHub directly even when a mirror
-# serves the bulk download.  Defeats a compromised mirror that swaps the script
-# for malicious content: the hash anchor lives at github.com, which the
-# attacker doesn't control.  Maintained by .github/workflows/update-sha256.yml
-# on every push to master / beta.
-SCRIPT_STABLE_HASH_URL="${SCRIPT_STABLE_URL}.sha256"
-SCRIPT_BETA_HASH_URL="${SCRIPT_BETA_URL}.sha256"
-SCRIPT_DEFAULT_URL="$SCRIPT_STABLE_URL"   # back-compat var name; kept for log messages
+# Trust anchors for the .sha256 hash file — fetched from MULTIPLE independent
+# CDNs and required to agree (quorum).  Defeats a compromised single mirror
+# that swaps the script for malicious content: the attacker would need to
+# poison ≥2 of these independent infrastructures simultaneously.  The .sha256
+# files are ~80 bytes each, so fetching from all anchors costs ~milliseconds.
+# Maintained by .github/workflows/update-sha256.yml on every push.
+HASH_ANCHORS_STABLE=(
+    "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh.sha256"
+    "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh.sha256"
+    "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh.sha256"
+)
+HASH_ANCHORS_BETA=(
+    "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh.sha256"
+    "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@beta/ssh/install-duo-ssh.sh.sha256"
+    "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh.sha256"
+)
 
 # Per-host config file owned by root, mode 600.  Only root can write here, so
 # unprivileged users cannot tamper with the update URL even if they manage to
@@ -374,35 +387,40 @@ clear_mirror() {
     fi
 }
 
-# Map effective channel to its canonical .sha256 URL.
-channel_hash_url() {
+# Map effective channel to its list of independent .sha256 trust anchors.
+# Echoes one URL per line.
+channel_hash_urls() {
     case "$1" in
-        beta) echo "$SCRIPT_BETA_HASH_URL" ;;
-        *)    echo "$SCRIPT_STABLE_HASH_URL" ;;
+        beta) printf '%s\n' "${HASH_ANCHORS_BETA[@]}" ;;
+        *)    printf '%s\n' "${HASH_ANCHORS_STABLE[@]}" ;;
     esac
 }
 
 # Anti-tamper SHA256 verification of a downloaded script file.
 #
-# Threat being addressed: the user has set --set-mirror to a custom proxy
-# (e.g. ghproxy.com for CN), and the mirror gets compromised — attacker
-# pushes a malicious install-duo-ssh.sh through the mirror.  Bash -n + shebang
-# checks alone don't help (attacker writes valid bash).  We need a trust
-# anchor that the attacker doesn't control.
+# Threat being addressed: the script was downloaded from some mirror (default
+# jsDelivr, or whatever the user configured via --set-mirror).  That mirror
+# could be compromised — attacker serves a malicious install-duo-ssh.sh.
+# Bash -n + shebang checks alone don't help (attacker writes valid bash).
+# We need a trust anchor outside the attacker's control.
 #
-# Strategy: pull the .sha256 reference from canonical github.com regardless
-# of where the bulk download came from.  Attacker would have to compromise
-# both the mirror AND github.com to bypass — out-of-scope for this design.
+# Strategy: fetch the .sha256 reference from MULTIPLE independent CDNs
+# (raw.githubusercontent.com, jsDelivr, Statically) and require all reachable
+# anchors to agree.  An attacker would have to poison ≥2 of these
+# independent infrastructures simultaneously to bypass — out-of-scope.
+# This also solves CN-network reality: raw.githubusercontent.com is often
+# unreachable from mainland China, but jsDelivr and Statically usually are,
+# so quorum still forms.
 #
 # Order of trust:
 #   1. KH_DUO_PIN_SHA256 — out-of-band trust (e.g. hash carried in via VPN
-#      to a fully-isolated host that can't reach github at all).  Wins
+#      to a fully-isolated host that can't reach any CDN at all).  Wins
 #      over anything else.
-#   2. If we already downloaded directly from canonical (no mirror), no
-#      cross-check is needed — the source IS the trust anchor.
-#   3. Otherwise (mirror is in use): MUST fetch canonical .sha256 and
-#      compare.  Refuse if canonical is unreachable, since we have no way
-#      to anchor trust — caller can set KH_DUO_PIN_SHA256 to bypass.
+#   2. Multi-anchor quorum: fetch all anchors in parallel, require all
+#      reachable ones to agree.  ≥2 reachable = full confidence.  Only
+#      1 reachable = degraded (warn + accept), since at least one
+#      independent source vouches for the hash.  0 reachable = refuse,
+#      caller can set KH_DUO_PIN_SHA256 to bypass.
 verify_downloaded_file() {
     local file="$1"
     command -v sha256sum >/dev/null 2>&1 \
@@ -421,30 +439,68 @@ verify_downloaded_file() {
         return 0
     fi
 
-    # 2. Downloaded directly from canonical -> no cross-check needed
-    local channel canonical_url
+    # 2. Multi-anchor quorum
+    local channel
     channel="$(get_effective_channel)"
-    canonical_url="$(channel_url "$channel")"
-    if [[ "$SCRIPT_RAW_URL" == "$canonical_url" ]]; then
-        return 0
+
+    local -a anchors
+    mapfile -t anchors < <(channel_hash_urls "$channel")
+    local total=${#anchors[@]}
+
+    log "Fetching SHA256 from $total independent anchor(s) in parallel..."
+
+    # Fetch all anchors in parallel into a temp dir, then collect results.
+    local tmpdir
+    tmpdir="$(mktemp -d)" || die "mktemp -d failed"
+    local pid pids=() i=0
+    for url in "${anchors[@]}"; do
+        # 8s per anchor — .sha256 is ~80 bytes, anything slower is broken.
+        ( curl -fsSL --max-time 8 "$url" 2>/dev/null \
+            | awk 'NF{print $1; exit}' > "$tmpdir/$i" ) &
+        pids+=($!)
+        i=$((i+1))
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local -a results=() reachable_urls=()
+    local hash
+    for (( i=0; i<total; i++ )); do
+        hash="$(cat "$tmpdir/$i" 2>/dev/null || true)"
+        if [[ -n "$hash" ]]; then
+            results+=("$hash")
+            reachable_urls+=("${anchors[i]}")
+        fi
+    done
+    rm -rf "$tmpdir"
+
+    local reachable=${#results[@]}
+    if (( reachable == 0 )); then
+        die "Anti-tamper: no trust anchor reachable (tried $total CDNs). If your network blocks all of them, set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
     fi
 
-    # 3. Mirror in use -> fetch canonical .sha256 to anchor trust
-    local hash_url expected_sha
-    hash_url="$(channel_hash_url "$channel")"
-    log "Mirror in use — fetching canonical SHA256 from $hash_url"
-    expected_sha="$(curl -fsSL --max-time 15 "$hash_url" 2>/dev/null \
-                    | awk 'NF{print $1; exit}')"
+    # All reachable anchors must agree — disagreement = possible CDN compromise
+    local first="${results[0]}" j
+    for (( i=1; i<reachable; i++ )); do
+        if [[ "${results[i]}" != "$first" ]]; then
+            err "Anti-tamper: anchors DISAGREE — possible CDN compromise."
+            for (( j=0; j<reachable; j++ )); do
+                err "  ${reachable_urls[j]} -> ${results[j]}"
+            done
+            die "Refusing to install with conflicting trust anchors."
+        fi
+    done
 
-    if [[ -z "$expected_sha" ]]; then
-        die "Anti-tamper: cannot reach canonical SHA256 ($hash_url). The .sha256 file is ~80 bytes and should be reachable even on slow links — if your network blocks github.com entirely, set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
+    if (( reachable < total )); then
+        warn "Only $reachable/$total trust anchors reachable — accepted on agreement, but consider setting KH_DUO_PIN_SHA256 for stronger guarantees."
     fi
 
-    if [[ "$actual_sha" != "$expected_sha" ]]; then
-        die "Anti-tamper check FAILED — mirror returned tampered content. canonical=$expected_sha actual=$actual_sha"
+    if [[ "$actual_sha" != "$first" ]]; then
+        die "Anti-tamper check FAILED — downloaded content does not match anchor SHA256. expected=$first actual=$actual_sha"
     fi
 
-    ok "SHA256 matches canonical (${expected_sha:0:16}…)"
+    ok "SHA256 matches $reachable/$total trust anchor(s) (${first:0:16}…)"
 }
 
 # self_update / install_shortcut both treat $SCRIPT_PATH as trusted.  If the

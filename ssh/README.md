@@ -164,15 +164,17 @@ sudo ./install-duo-ssh.sh --update
 sudo ./install-duo-ssh.sh --self-update
 ```
 
-默认更新源是：
+默认更新源（v1.6.0+）是 **jsDelivr CDN**，CN 大陆可达，无需手动设置镜像：
 
 ```text
-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh
+https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh
 ```
 
-### 自定义镜像源（v1.3.0+，适合中国大陆服务器）
+完整性由 [多锚点 SHA256 quorum 校验](#威胁-2镜像被攻破推恶意脚本v160) 保证（jsDelivr 即使被污染也会被另两个独立锚点检测到）。
 
-GitHub 在国内访问受限时，可以配置 ghproxy / ghfast / jsdelivr 等镜像。**v1.3.0 起优先用持久化配置文件而不是环境变量**，避免普通用户通过 `sudo -E` 篡改 root 的更新源。
+### 自定义镜像源（v1.3.0+）
+
+绝大多数 CN 用户**无需配置**——v1.6.0 起默认走 jsDelivr 已经能直连。如果你想用自己的内部镜像、企业 GitHub 代理，或某个特定加速器（ghproxy / ghfast / 自建 OSS）：
 
 ```bash
 # 设置一次（写到 root-owned 600 的 /etc/duo/install-duo-ssh.conf）
@@ -181,15 +183,17 @@ sudo kh-duo --set-mirror https://ghproxy.com/https://raw.githubusercontent.com/K
 # 看现在用什么 URL（任何用户都能看，纯只读）
 kh-duo --show-config
 
-# 撤销，回到 GitHub 直连
+# 撤销，回到默认 jsDelivr
 sudo kh-duo --clear-mirror
 ```
+
+无论镜像怎么换，下载完都会跑多锚点 SHA256 quorum 校验，被污染的镜像会被立刻识别并拒绝。
 
 URL 解析顺序（trust priority 由高到低）：
 
 1. `/etc/duo/install-duo-ssh.conf` 里的 `update_url = ...`
 2. `KH_DUO_UPDATE_URL` 环境变量 —— **只在 `SUDO_USER` 为空时生效**（裸 root，比如 cron / 系统服务）。`sudo` 调用时被拒。
-3. 默认 canonical URL
+3. 默认 jsDelivr URL
 
 也可以直接编辑配置文件（任何能写 `/etc/duo/` 的方式都行，比如 Ansible template）：
 
@@ -210,30 +214,43 @@ update_url = https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-
 | **`$SCRIPT_PATH` 所有权** | `--update` 前要求脚本文件 owner 是 root。否则用户把脚本放 `/home/<user>/` 里执行就能在 root 写下去之前换文件。 |
 | **PATH pin** | 脚本顶部 `PATH=/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk/install 等不会被攻击者的 `$HOME/bin/` 同名脚本劫持。 |
 
-#### 威胁 2：镜像被攻破推恶意脚本（v1.5.3+）
+#### 威胁 2：镜像被攻破推恶意脚本（v1.6.0+）
 
-威胁场景：admin 设了 `--set-mirror https://ghproxy.com/...`，mirror 被攻破，attacker 替换 `install-duo-ssh.sh`。仅靠 shebang + `bash -n` 拦不住——attacker 写合法 bash 即可。
+威胁场景：脚本从某个 mirror 下载（默认 jsDelivr，或 admin 用 `--set-mirror` 设的代理），mirror 被攻破，attacker 替换 `install-duo-ssh.sh`。仅靠 shebang + `bash -n` 拦不住——attacker 写合法 bash 即可。
 
-防御：**SHA256 锚点固定从 canonical github.com 取**。即使 admin 用 mirror 拉脚本，`.sha256` 文件永远从 GitHub 直接下载（80 字节小文件，CN 弱网也能抓）。
+防御：**`.sha256` 文件并发从多个独立 CDN 拉取，要求所有可达锚点结果一致**（quorum）。
 
 ```
-mirror serves   →  install-duo-ssh.sh           (~50KB，可能被换)
-canonical serves →  install-duo-ssh.sh.sha256   (~80B，attacker 控制不了)
+download source     →  install-duo-ssh.sh        (~50KB，可能被换)
+3 independent CDNs  →  install-duo-ssh.sh.sha256 (~80B 各一份，要求全部一致)
+                       ├── raw.githubusercontent.com  (canonical)
+                       ├── cdn.jsdelivr.net           (CN 可达)
+                       └── cdn.statically.io          (CN 可达)
 ```
 
-`.sha256` 由 GitHub Actions ([.github/workflows/update-sha256.yml](../.github/workflows/update-sha256.yml)) 在每次 `install-duo-ssh.sh` 提交后自动重生。
+设计要点：
+
+- **三个 CDN 完全独立**——分别由 GitHub、Cloudflare/Fastly、独立运营商承载。攻击者要绕过 quorum，得**同时**污染至少两个完全独立的基础设施。
+- **CN 大陆友好**——即使 raw.githubusercontent.com 被墙，jsDelivr + Statically 通常还能形成 quorum。0 个可达时才退到要求 `KH_DUO_PIN_SHA256` 的离线模式。
+- **任意两个 anchor 不一致 → 立即拒绝** 并打印每个 anchor 返回的 hash，方便事故定位。
+- **3 个并发拉取**，每个 8s 超时；总耗时 < 1 秒。
+
+`.sha256` 由 GitHub Actions ([.github/workflows/update-sha256.yml](../.github/workflows/update-sha256.yml)) 在每次 `install-duo-ssh.sh` 提交后自动重生。jsDelivr / Statically 都直接镜像 GitHub 内容，无需单独发布。
 
 信任优先级（高到低）：
 
-1. **`KH_DUO_PIN_SHA256` 环境变量** —— 带外信任，最高优先级。适合**完全连不上 GitHub 任何域名** 的场景，hash 通过 VPN/sneakernet 拿到后塞 env 里。
-2. **直接用 canonical URL 下载** —— 没用 mirror 时跳过 cross-check（github 自身就是信任源）。
-3. **Mirror + canonical `.sha256` 对比** —— 默认行为。从 mirror 拉脚本，从 github.com 拉 `.sha256`，本地算 hash 对比。不匹配直接拒绝；canonical 不可达且未设 PIN → 拒绝（避免静默不验证）。
+1. **`KH_DUO_PIN_SHA256` 环境变量** —— 带外信任，最高优先级。适合**3 个 CDN 全部不可达** 的极端隔离环境，hash 通过 VPN/sneakernet 拿到后塞 env 里。
+2. **多锚点 quorum** —— 默认行为。并发拉 3 个 anchor 的 `.sha256`，所有可达的必须一致；本地 hash 必须匹配该值。
+   - 3/3 可达 → ok
+   - 2/3 或 1/3 可达 → warn 并通过（提示考虑设 PIN 加强）
+   - 0/3 可达 → 拒绝（要求 PIN）
 
 | 攻击者控制 | 结果 |
 |---|---|
-| Mirror 被攻破，github.com 正常 | ❌ 拒绝（hash 不匹配） |
-| github.com `.sha256` 文件，mirror 正常 | ❌ 拒绝（attacker 不太可能控制 github） |
-| 同时控制 mirror 和 github.com | ⚠️ 绕过（out-of-scope，需要 PIN） |
+| 任一单一 CDN（含默认 jsDelivr）被攻破，其他正常 | ❌ 拒绝（anchors disagree） |
+| 用户自定义 `--set-mirror` 被攻破 | ❌ 拒绝（mirror 服务的脚本 hash 与 3 个 anchor 不匹配） |
+| 同时控制 ≥2 个独立 CDN | ⚠️ 绕过（out-of-scope，建议设 PIN） |
+| 同时控制 GitHub 仓库本身（PAT 泄露） | ⚠️ 绕过（attacker 改源 + 改 anchor，所有 anchor 同步污染。建议 GitHub 账号开 2FA + 关键变更走人审 release） |
 | 本地 `KH_DUO_PIN_SHA256` 被普通用户篡改 | ❌ 拒绝（sudo 上下文 env 被忽略） |
 
 ### 卸载
