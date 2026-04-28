@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.4"
+SCRIPT_VERSION="1.6.5"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1000,9 +1000,19 @@ read_existing_config() {
 
     if [[ ! -f "$SSHD_CONFIG" ]]; then return 0; fi
 
-    # Slice out only the script-managed block — everything from the marker comment to EOF
+    # Slice out only the script-managed block.  Prefer the v1.6.5+ sentinels
+    # (kh-duo-sshd-begin / kh-duo-sshd-end) which give exact boundaries; fall
+    # back to the legacy "# === Duo 2FA for SSH (PAM mode" header → EOF for
+    # older installs that haven't been re-applied under v1.6.5.
     local duo_block
-    duo_block="$(awk '/^# === Duo 2FA for SSH \(PAM mode/{flag=1} flag' "$SSHD_CONFIG")"
+    duo_block="$(awk '
+        /^# kh-duo-sshd-begin/ {flag=1; next}
+        /^# kh-duo-sshd-end/   {flag=0; exit}
+        flag {print}
+    ' "$SSHD_CONFIG")"
+    if [[ -z "$duo_block" ]]; then
+        duo_block="$(awk '/^# === Duo 2FA for SSH \(PAM mode/{flag=1} flag' "$SSHD_CONFIG")"
+    fi
     [[ -z "$duo_block" ]] && return 0
 
     if printf '%s\n' "$duo_block" | grep -qE '^[[:space:]]*AuthenticationMethods[[:space:]]+publickey,keyboard-interactive:pam[[:space:]]+keyboard-interactive:pam'; then
@@ -1831,16 +1841,31 @@ do_uninstall() {
     backup_file "$SSHD_CONFIG"
     backup_file "$PAM_SSHD"
 
-    # Remove AuthenticationMethods + Duo banner from sshd_config
+    # Remove the script-managed Duo block from sshd_config.
+    # Same two-pass strip as apply_sshd: new sentinel format first, then
+    # legacy-format fallback (covers v1.6.4-and-earlier installs that may
+    # have accumulated multiple stale Match blocks).
     python3 - "$SSHD_CONFIG" <<'PYEOF'
 import sys, re, pathlib
 p = pathlib.Path(sys.argv[1])
 text = p.read_text()
+
 text = re.sub(
-    r'\n*# === Duo 2FA for SSH.*?AuthenticationMethods\s+publickey,keyboard-interactive:pam[^\n]*\n',
-    '\n', text, flags=re.DOTALL)
-text = re.sub(r'^\s*AuthenticationMethods\s+publickey,keyboard-interactive:pam\b[^\n]*\n',
-              '', text, flags=re.MULTILINE)
+    r'(?ms)\n*^# kh-duo-sshd-begin\b.*?^# kh-duo-sshd-end\b[^\n]*\n?',
+    '\n', text)
+
+text = re.sub(
+    r'(?ms)\n*^# === Duo 2FA for SSH\b.*\Z',
+    '\n', text)
+
+# Belt-and-braces: also strip any remaining stray top-level AuthMethods
+# the script could have written outside both formats.
+text = re.sub(
+    r'(?m)^\s*AuthenticationMethods\s+publickey,keyboard-interactive:pam\b[^\n]*\n',
+    '', text)
+
+text = re.sub(r'\n{3,}', '\n\n', text)
+text = text.rstrip() + '\n'
 p.write_text(text)
 PYEOF
 
@@ -1957,46 +1982,53 @@ patch_sshd_config() {
         fi
     fi
 
-    # Clean up old ForceCommand login_duo / stray AuthenticationMethods
+    # ── Strip ANY previously-written Duo block (idempotent) ────────────
+    # Two passes:
+    #
+    #   1. New format (v1.6.5+): everything between "# kh-duo-sshd-begin"
+    #      and "# kh-duo-sshd-end" sentinel comments.  Single regex, robust
+    #      across multiple re-runs.
+    #
+    #   2. Legacy format (≤ v1.6.4): from the first "# === Duo 2FA for SSH"
+    #      header through EOF.  Pre-1.6.5 always *appended* its block at the
+    #      end of the file, so anything from that header onwards was ours.
+    #      This catches the broken-state where re-running the installer
+    #      stacked multiple Match blocks (the bug fixed by v1.6.5 — a stray
+    #      "AuthenticationMethods publickey,keyboard-interactive:pam" line
+    #      ended up nested inside a Match block, only enforcing Duo for
+    #      127.0.0.0/8 connections while leaving the global scope as 'any').
     python3 - "$SSHD_CONFIG" <<'PYEOF'
 import sys, re, pathlib
 p = pathlib.Path(sys.argv[1])
-lines = p.read_text().splitlines(keepends=True)
-out, i = [], 0
-while i < len(lines):
-    line = lines[i]
-    if re.match(r'^\s*Match\s+', line):
-        block = [line]; j = i + 1; has_login_duo = False
-        while j < len(lines):
-            nxt = lines[j]
-            if re.match(r'^\s*Match\b', nxt): break
-            if re.match(r'^\S', nxt) and not re.match(r'^\s*#', nxt) and nxt.strip():
-                break
-            block.append(nxt)
-            if re.search(r'ForceCommand\s+/usr/sbin/login_duo', nxt):
-                has_login_duo = True
-            j += 1
-        if has_login_duo:
-            i = j; continue
-        out.extend(block); i = j; continue
-    if re.search(r'^\s*ForceCommand\s+/usr/sbin/login_duo', line):
-        i += 1; continue
-    if re.search(r'Duo 2FA for SSH', line):
-        i += 1; continue
-    if re.match(r'^\s*AuthenticationMethods\b', line):
-        i += 1; continue
-    out.append(line); i += 1
-p.write_text("".join(out))
+text = p.read_text()
+
+# (1) Strip new-format sentinel block (current and future installs)
+text = re.sub(
+    r'(?ms)\n*^# kh-duo-sshd-begin\b.*?^# kh-duo-sshd-end\b[^\n]*\n?',
+    '\n', text)
+
+# (2) Legacy strip: from first "# === Duo 2FA for SSH" header to EOF.
+#     This deletes the v1.6.4-and-earlier appended block, including all
+#     accumulated stale Match blocks left behind by the old broken cleanup.
+text = re.sub(
+    r'(?ms)\n*^# === Duo 2FA for SSH\b.*\Z',
+    '\n', text)
+
+# Tidy: collapse runs of 3+ blank lines down to exactly one
+text = re.sub(r'\n{3,}', '\n\n', text)
+# Ensure file ends with a single newline
+text = text.rstrip() + '\n'
+p.write_text(text)
 PYEOF
 
-    # Add AuthenticationMethods
-    #   Default:           publickey + Duo (PAM stack = pam_duo only)
-    #   --allow-password:  publickey path runs the full pam_unix+pam_duo stack
-    #                      (so publickey users see one password+Duo prompt set);
-    #                      the second alternative `keyboard-interactive:pam`
-    #                      lets keyless users authenticate via password+Duo.
-    #                      We avoid `password,keyboard-interactive:pam` because
-    #                      it would invoke PAM twice and double-prompt the user.
+    # ── Write fresh Duo block, fully wrapped in sentinels ──────────────
+    # Default:           publickey + Duo (PAM stack = pam_duo only)
+    # --allow-password:  publickey path runs the full pam_unix+pam_duo stack
+    #                    (so publickey users see one password+Duo prompt set);
+    #                    the second alternative `keyboard-interactive:pam`
+    #                    lets keyless users authenticate via password+Duo.
+    #                    We avoid `password,keyboard-interactive:pam` because
+    #                    it would invoke PAM twice and double-prompt.
     local auth_line
     if [[ $ALLOW_PASSWORD -eq 1 ]]; then
         auth_line='AuthenticationMethods publickey,keyboard-interactive:pam keyboard-interactive:pam'
@@ -2006,6 +2038,7 @@ PYEOF
 
     {
         echo ""
+        echo "# kh-duo-sshd-begin (managed by install-duo-ssh.sh — do not edit between markers)"
         echo "# === Duo 2FA for SSH (PAM mode, added by install-duo-ssh.sh) ==="
         echo "$auth_line"
 
@@ -2031,6 +2064,8 @@ PYEOF
             echo "Match User $BREAKGLASS_USER"
             echo "    AuthenticationMethods publickey"
         fi
+
+        echo "# kh-duo-sshd-end"
     } >> "$SSHD_CONFIG"
     ok "Added AuthenticationMethods"
     if [[ $BYPASS_LOCAL -eq 1 ]];      then ok "Bypass Duo for localhost and self connections"; fi
