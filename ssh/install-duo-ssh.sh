@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.6"
+SCRIPT_VERSION="1.6.7"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -815,17 +815,25 @@ EOF
     systemctl enable --now kh-duo-update.timer >/dev/null 2>&1 \
         || { warn "systemctl enable --now kh-duo-update.timer failed"; return 1; }
 
-    # Verify it's actually scheduled
-    if systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1 \
-       && systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
-            | grep -q kh-duo-update; then
-        local nextrun
-        nextrun=$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
-                  | awk '/kh-duo-update/{print $1, $2; exit}')
-        ok "systemd timer enabled  (next run: ${nextrun:-unknown})"
-        return 0
+    # Verify it's actually scheduled.  We capture list-timers output to a
+    # local var BEFORE pattern-matching: piping into `grep -q` makes grep
+    # close its stdin as soon as it finds a match, which sends SIGPIPE to
+    # `systemctl list-timers`, and `set -o pipefail` (set at the top of the
+    # script) then propagates that 141 exit code as the pipe's exit — the
+    # whole `&&` chain falsely reads as "verify failed" even when the timer
+    # is actually scheduled.  Capturing first sidesteps the SIGPIPE entirely.
+    if ! systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1; then
+        return 1
     fi
-    return 1
+    local timers_out
+    timers_out="$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null)"
+    if [[ "$timers_out" != *"kh-duo-update"* ]]; then
+        return 1
+    fi
+    local nextrun
+    nextrun="$(printf '%s\n' "$timers_out" | awk '/kh-duo-update/{print $1, $2; exit}')"
+    ok "systemd timer enabled  (next run: ${nextrun:-unknown})"
+    return 0
 }
 
 install_auto_update_cron() {
@@ -904,9 +912,13 @@ uninstall_auto_update() {
 auto_update_status() {
     if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" ]]; then
         if has_systemd && systemctl is-enabled kh-duo-update.timer >/dev/null 2>&1; then
-            local nextrun
-            nextrun=$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null \
-                      | awk '/kh-duo-update/{print $1, $2; exit}')
+            # Capture list-timers output first; awk's `exit` would otherwise
+            # SIGPIPE the upstream systemctl and pipefail would surface that
+            # as a non-zero exit (cosmetic effect: shows "unknown" timer time
+            # in the status string).
+            local timers_out nextrun
+            timers_out="$(systemctl list-timers kh-duo-update.timer --no-pager 2>/dev/null)"
+            nextrun="$(printf '%s\n' "$timers_out" | awk '/kh-duo-update/{print $1, $2; exit}')"
             printf 'systemd timer (next: %s)' "${nextrun:-unknown}"
             return
         fi
