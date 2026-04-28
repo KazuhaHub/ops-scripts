@@ -32,13 +32,21 @@
 # Maintenance:
 #   sudo ./install-duo-ssh.sh --install-shortcut       # create /usr/local/bin/kh-duo → this script
 #        ./install-duo-ssh.sh --check-update           # read-only, no root required
-#   sudo ./install-duo-ssh.sh --self-update            # download latest from GitHub and replace
+#   sudo ./install-duo-ssh.sh --self-update            # download latest and replace
 #        ./install-duo-ssh.sh --version                # print version and exit (no root)
+#        ./install-duo-ssh.sh --show-config            # print effective update URL + sources
+#   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL
+#                                                        (root-only file at /etc/duo/install-duo-ssh.conf)
+#   sudo ./install-duo-ssh.sh --clear-mirror           # remove persistent mirror, revert to default
 #
 # Env vars:
 #   DUO_IKEY / DUO_SKEY / DUO_HOST   Duo application credentials (skip prompts)
-#   KH_DUO_UPDATE_URL                override upstream raw URL — must start with
-#                                    https://raw.githubusercontent.com/  (refused otherwise)
+#   KH_DUO_UPDATE_URL                override update URL — IGNORED when invoked
+#                                    via sudo from a non-root caller (anti-tamper).
+#                                    Use --set-mirror for persistent overrides.
+#   KH_DUO_PIN_SHA256                if set, downloaded script must match this
+#                                    SHA256 hash before installation (out-of-band
+#                                    trust for hosts that cannot reach canonical).
 #   KH_DUO_SHORTCUT                  override shortcut path (must be under
 #                                    /usr/local/{bin,sbin}/ or /usr/{bin,sbin}/)
 #
@@ -74,6 +82,10 @@ INTERACTIVE_FLAGS_USED=0
 ACTION_CHECK_UPDATE=0
 ACTION_SELF_UPDATE=0
 ACTION_INSTALL_SHORTCUT=0
+ACTION_SET_MIRROR=0
+ACTION_CLEAR_MIRROR=0
+ACTION_SHOW_CONFIG=0
+SET_MIRROR_URL=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="/root/duo-install-backup-${TS}"
@@ -84,9 +96,19 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.2.1"
-SCRIPT_TRUSTED_URL_PREFIX="https://raw.githubusercontent.com/"
-SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
+SCRIPT_VERSION="1.3.0"
+
+# Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
+# (set via `--set-mirror <url>` or by editing the file as root).  See
+# resolve_update_url() below for the order of trust.
+SCRIPT_DEFAULT_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+
+# Per-host config file owned by root, mode 600.  Only root can write here, so
+# unprivileged users cannot tamper with the update URL even if they manage to
+# leak environment variables to root via `sudo -E`.
+SCRIPT_CONFIG_FILE="/etc/duo/install-duo-ssh.conf"
+
+SCRIPT_RAW_URL=""   # set by resolve_update_url() before any URL fetch
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
 
 # Minimum required Duo Unix version (CA bundle expiry on 2026-04-15 — see docs)
@@ -127,6 +149,9 @@ while [[ $# -gt 0 ]]; do
         --check-update) ACTION_CHECK_UPDATE=1; shift ;;
         --self-update)  ACTION_SELF_UPDATE=1; shift ;;
         --install-shortcut) ACTION_INSTALL_SHORTCUT=1; shift ;;
+        --set-mirror)   ACTION_SET_MIRROR=1; SET_MIRROR_URL="$2"; shift 2 ;;
+        --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
+        --show-config)  ACTION_SHOW_CONFIG=1; shift ;;
         --version|-V)   printf 'install-duo-ssh.sh %s\n' "${SCRIPT_VERSION:-unknown}"; exit 0 ;;
         -y|--yes)       ASSUME_YES=1; shift ;;
         -h|--help)      usage 0 ;;
@@ -156,15 +181,99 @@ ver_lt() {
     [[ "$lower" == "$1" ]]
 }
 
-# Refuse update URLs that don't sit under the trusted prefix.  Without this an
-# attacker who can pass env through sudo (e.g. `sudo -E KH_DUO_UPDATE_URL=...`)
-# could redirect --self-update to a host they control and get root to install
-# arbitrary code into $SCRIPT_PATH.
-validate_update_url() {
-    case "$SCRIPT_RAW_URL" in
-        "$SCRIPT_TRUSTED_URL_PREFIX"*) ;;
-        *) die "Refusing untrusted update URL '$SCRIPT_RAW_URL' — must start with $SCRIPT_TRUSTED_URL_PREFIX" ;;
+# Resolve the URL to use for self-update / version checks.  Order of trust:
+#   1. /etc/duo/install-duo-ssh.conf (`update_url = ...`) — root-owned, mode
+#      600.  Set via `--set-mirror <url>` or by editing the file as root.
+#      Persistent across runs and immune to env-var poisoning, since only
+#      root can write to it.
+#   2. KH_DUO_UPDATE_URL env var — honored ONLY when there is no $SUDO_USER
+#      (i.e., we are running as raw root, not via sudo from an unprivileged
+#      account).  This blocks the `KH_DUO_UPDATE_URL=evil sudo -E kh-duo`
+#      attack where an unprivileged user leaks env to root.
+#   3. SCRIPT_DEFAULT_URL.
+resolve_update_url() {
+    if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
+        local conf_url
+        conf_url="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*update_url[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null)"
+        if [[ -n "$conf_url" ]]; then
+            SCRIPT_RAW_URL="$conf_url"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${KH_DUO_UPDATE_URL:-}" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            warn "Ignoring KH_DUO_UPDATE_URL — invoked via sudo (SUDO_USER=$SUDO_USER), so the env var could be supplied by an unprivileged caller."
+            warn "To set a persistent custom URL, run as root:  kh-duo --set-mirror <url>"
+        else
+            SCRIPT_RAW_URL="$KH_DUO_UPDATE_URL"
+            return 0
+        fi
+    fi
+
+    SCRIPT_RAW_URL="$SCRIPT_DEFAULT_URL"
+}
+
+# Write the URL to the persistent root-owned config file.
+set_mirror() {
+    local url="$1"
+    [[ -n "$url" ]] || die "set_mirror: empty URL"
+
+    case "$url" in
+        https://*) ;;
+        *) die "Refusing non-https URL: $url" ;;
     esac
+
+    require_root
+
+    mkdir -p "$(dirname "$SCRIPT_CONFIG_FILE")"
+
+    umask 077
+    local tmp
+    tmp="$(mktemp)" || die "mktemp failed"
+    {
+        echo "# Kazuha Hub Duo installer config (managed by install-duo-ssh.sh)"
+        echo "# This file is loaded before each --self-update / --check-update."
+        echo "# Only root can write here, so unprivileged users cannot redirect updates."
+        echo ""
+        echo "update_url = $url"
+    } > "$tmp"
+
+    install -m 600 -o root -g root "$tmp" "$SCRIPT_CONFIG_FILE" 2>/dev/null || {
+        cp "$tmp" "$SCRIPT_CONFIG_FILE"
+        chmod 600 "$SCRIPT_CONFIG_FILE"
+        chown root:root "$SCRIPT_CONFIG_FILE" 2>/dev/null || true
+    }
+    rm -f "$tmp"
+    ok "Persistent mirror URL set in $SCRIPT_CONFIG_FILE"
+    ok "  $url"
+}
+
+clear_mirror() {
+    require_root
+    if [[ -f "$SCRIPT_CONFIG_FILE" ]]; then
+        rm -f "$SCRIPT_CONFIG_FILE"
+        ok "Removed $SCRIPT_CONFIG_FILE — reverting to default canonical URL"
+        ok "  $SCRIPT_DEFAULT_URL"
+    else
+        ok "No persistent mirror config to clear (already on default)"
+    fi
+}
+
+# Optional SHA256 pin for out-of-band trust (e.g. hosts that cannot reach
+# GitHub at all and want to verify a known-good hash from sneakernet).
+verify_pinned_sha256() {
+    local file="$1"
+    [[ -z "${KH_DUO_PIN_SHA256:-}" ]] && return 0
+
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found — required for KH_DUO_PIN_SHA256"
+
+    local actual_sha
+    actual_sha="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$KH_DUO_PIN_SHA256" ]]; then
+        die "SHA256 pin check FAILED: pinned=$KH_DUO_PIN_SHA256 actual=$actual_sha"
+    fi
+    ok "SHA256 matches KH_DUO_PIN_SHA256 ($actual_sha)"
 }
 
 # self_update / install_shortcut both treat $SCRIPT_PATH as trusted.  If the
@@ -213,6 +322,7 @@ self_update() {
     bash -n "$tmp" 2>/dev/null || {
         rm -f "$tmp"; die "Downloaded file failed syntax check — refusing to install"
     }
+    verify_pinned_sha256 "$tmp" || { rm -f "$tmp"; die "SHA256 pin verification failed"; }
     local backup="${SCRIPT_PATH}.bak.${TS}"
     cp -a "$SCRIPT_PATH" "$backup" || die "Backup of current script failed"
     if ! install -m 755 "$tmp" "$SCRIPT_PATH" 2>/dev/null; then
@@ -561,8 +671,9 @@ What would you like to do?
   3) Show current configuration
   4) Uninstall Duo 2FA
   5) Check for script updates
-  6) Install / refresh the 'kh-duo' shortcut
-  7) Quit without changes
+  6) Set/clear update mirror URL  (for hosts behind GitHub-blocked networks)
+  7) Install / refresh the 'kh-duo' shortcut
+  8) Quit without changes
 
 EOF
         local action=""
@@ -573,11 +684,52 @@ EOF
             3)    show_current_config ;;
             4)    menu_uninstall_flow; return 0 ;;
             5)    menu_check_and_update ;;
-            6)    install_shortcut ;;
-            7)    ok "No changes made."; exit 0 ;;
+            6)    menu_set_mirror ;;
+            7)    install_shortcut ;;
+            8)    ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
     done
+}
+
+# Sub-menu: set or clear the persistent update mirror URL.
+menu_set_mirror() {
+    echo
+    log "Current update URL"
+    echo "  $SCRIPT_RAW_URL"
+    echo
+    if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
+        echo "  (persisted in $SCRIPT_CONFIG_FILE)"
+    else
+        echo "  (using default — no persistent config)"
+    fi
+    echo
+    echo "  1) Set a new mirror URL (persists in $SCRIPT_CONFIG_FILE, root-only)"
+    echo "  2) Clear mirror (revert to default canonical GitHub URL)"
+    echo "  q) Cancel"
+    echo
+    local action=""
+    read -r -p "Choice: " action
+    case "$action" in
+        1)
+            local url=""
+            echo "  Examples for CN networks:"
+            echo "    https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+            echo "    https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
+            echo "    https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh"
+            echo
+            read -r -p "  Mirror URL (https://...): " url
+            [[ -z "$url" ]] && { warn "Empty URL — cancelled."; return 0; }
+            set_mirror "$url"
+            resolve_update_url   # refresh effective URL for the rest of this run
+            ;;
+        2)
+            clear_mirror
+            resolve_update_url
+            ;;
+        q|Q) ok "No changes." ;;
+        *)   warn "Invalid choice '$action'" ;;
+    esac
 }
 
 ### ─── OS detection ──────────────────────────────────────────────────────
@@ -1171,9 +1323,34 @@ fix_selinux() {
 
 ### ─── Main ───────────────────────────────────────────────────────────────
 
-# Validate trusted env input before doing ANYTHING else (root or not).  This
-# fails closed on the most dangerous override before any network I/O.
-validate_update_url
+# Resolve which URL self-update / check-update will use.  Persistent file
+# beats env var beats default.  Env var is ignored under sudo from a
+# non-root caller (anti-tamper against unprivileged users).
+resolve_update_url
+
+# --show-config: read-only diagnostic (no admin needed)
+if [[ $ACTION_SHOW_CONFIG -eq 1 ]]; then
+    echo
+    log "Update URL configuration"
+    echo "  Default:            $SCRIPT_DEFAULT_URL"
+    if [[ -r "$SCRIPT_CONFIG_FILE" ]]; then
+        echo "  Persistent config:  $SCRIPT_CONFIG_FILE"
+        local conf_url=""
+        conf_url="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*update_url[[:space:]]*=/{print $2; exit}' "$SCRIPT_CONFIG_FILE" 2>/dev/null)"
+        echo "    update_url      = ${conf_url:-(none)}"
+    else
+        echo "  Persistent config:  (none — using default or env override)"
+    fi
+    if [[ -n "${KH_DUO_UPDATE_URL:-}" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            echo "  Env override:       KH_DUO_UPDATE_URL=$KH_DUO_UPDATE_URL  (IGNORED — running via sudo)"
+        else
+            echo "  Env override:       KH_DUO_UPDATE_URL=$KH_DUO_UPDATE_URL"
+        fi
+    fi
+    echo "  Effective URL:      $SCRIPT_RAW_URL"
+    exit 0
+fi
 
 # --check-update is read-only — no system state is touched, only a curl + awk
 # of the upstream version field.  Run it without requiring root so users can
@@ -1194,6 +1371,16 @@ fi
 
 require_root
 detect_os
+
+# Mirror config writes happen as root, before any heavier setup.
+if [[ $ACTION_SET_MIRROR -eq 1 ]]; then
+    set_mirror "$SET_MIRROR_URL"
+    exit 0
+fi
+if [[ $ACTION_CLEAR_MIRROR -eq 1 ]]; then
+    clear_mirror
+    exit 0
+fi
 
 # Remaining quick-exit actions touch the filesystem as root, so they sit
 # after require_root.  Each one re-validates its preconditions internally.

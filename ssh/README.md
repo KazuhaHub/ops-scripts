@@ -164,17 +164,47 @@ sudo ./install-duo-ssh.sh --self-update
 https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh
 ```
 
-`KH_DUO_UPDATE_URL` 必须以 `https://raw.githubusercontent.com/` 开头，否则脚本会在任何网络 I/O 之前直接拒绝。这是为了防止通过 `sudo -E` 或 sudoers `env_keep` 让普通用户重定向 self-update 到攻击者控制的 URL：
+### 自定义镜像源（v1.3.0+，适合中国大陆服务器）
+
+GitHub 在国内访问受限时，可以配置 ghproxy / ghfast / jsdelivr 等镜像。**v1.3.0 起优先用持久化配置文件而不是环境变量**，避免普通用户通过 `sudo -E` 篡改 root 的更新源。
 
 ```bash
-# 允许：fork 在 GitHub 上的镜像
-sudo KH_DUO_UPDATE_URL=https://raw.githubusercontent.com/myfork/ops-scripts/master/ssh/install-duo-ssh.sh \
-     ./install-duo-ssh.sh --self-update
+# 设置一次（写到 root-owned 600 的 /etc/duo/install-duo-ssh.conf）
+sudo kh-duo --set-mirror https://ghproxy.com/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh
 
-# 拒绝：任何非 raw.githubusercontent.com 的源
-sudo KH_DUO_UPDATE_URL=https://example.com/x.sh ./install-duo-ssh.sh --self-update
-# → [x] Refusing untrusted update URL ...
+# 看现在用什么 URL（任何用户都能看，纯只读）
+kh-duo --show-config
+
+# 撤销，回到 GitHub 直连
+sudo kh-duo --clear-mirror
 ```
+
+URL 解析顺序（trust priority 由高到低）：
+
+1. `/etc/duo/install-duo-ssh.conf` 里的 `update_url = ...`
+2. `KH_DUO_UPDATE_URL` 环境变量 —— **只在 `SUDO_USER` 为空时生效**（裸 root，比如 cron / 系统服务）。`sudo` 调用时被拒。
+3. 默认 canonical URL
+
+也可以直接编辑配置文件（任何能写 `/etc/duo/` 的方式都行，比如 Ansible template）：
+
+```ini
+# /etc/duo/install-duo-ssh.conf
+update_url = https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh
+```
+
+### 防篡改设计
+
+威胁模型：**本地非特权用户**想让 root 的 `--self-update` 跑攻击者控制的脚本。
+
+防御层（按生效顺序）：
+
+| 层 | 怎么防 |
+|---|---|
+| **URL 来源** | 优先读 `/etc/duo/install-duo-ssh.conf`（root-owned 600）。`KH_DUO_UPDATE_URL` 在 sudo 上下文（`SUDO_USER` 非空）被拒，避免 `sudo -E KH_DUO_UPDATE_URL=evil kh-duo` 攻击。 |
+| **`$SCRIPT_PATH` 所有权** | `--self-update` 前要求当前脚本文件 owner 是 root。否则用户把脚本放 `/home/<user>/` 里执行就能在 root 写下去之前换文件。 |
+| **下载内容校验** | 必须以 `#!/bin/bash`/`#!/usr/bin/env bash` 开头，且能通过 `bash -n` 语法检查。下成 GitHub HTML 错误页或半截文件直接拒绝。 |
+| **可选 SHA256 pin** | 设 `KH_DUO_PIN_SHA256=<expected hash>`，下载内容必须匹配。适合完全连不上 GitHub、需要带外（VPN/sneakernet）确认 hash 的场景。 |
+| **PATH pin** | 脚本顶部 `PATH=/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk/install 等命令不会被攻击者放在 `$HOME/bin/` 的同名脚本劫持。 |
 
 ### 卸载
 
