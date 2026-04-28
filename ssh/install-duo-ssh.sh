@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.7"
+SCRIPT_VERSION="1.6.8"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -704,6 +704,20 @@ self_update() {
     else
         warn "Downgraded $old_ver → $new_ver  (backup: $backup)"
     fi
+
+    # Self-heal auto-update task on hosts that already have one configured.
+    # The newly installed code may include fixes to install_auto_update itself
+    # (e.g. v1.6.7 SIGPIPE fix, v1.6.8 duplicate-state cleanup).  Best-effort —
+    # auto-update is not a hard dependency of self-update.
+    if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" || -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+        log "Refreshing auto-update task with the freshly-installed code..."
+        if "$SCRIPT_PATH" --install-auto-update >/dev/null 2>&1; then
+            ok "Auto-update task refreshed"
+        else
+            warn "Auto-update task refresh failed; run 'sudo kh-duo --remove-auto-update && sudo kh-duo --install-auto-update' to recover"
+        fi
+    fi
+
     log "Re-run to load the new code: sudo $SCRIPT_PATH"
 }
 
@@ -857,6 +871,10 @@ EOF
 }
 
 # Public entrypoint — try systemd, fall back to cron, hard-fail if neither.
+# Self-heals duplicate state: when one path succeeds, any artifacts of the
+# OTHER path are removed.  This cleans up hosts left in dual-task state by
+# the v1.5.0-v1.6.6 SIGPIPE bug (where systemd timer was installed, then
+# the verify check falsely failed and the script also wrote a cron entry).
 install_auto_update() {
     [[ -n "${SCRIPT_PATH:-}" ]] || die "install_auto_update: SCRIPT_PATH not set"
 
@@ -864,6 +882,12 @@ install_auto_update() {
 
     if has_systemd; then
         if install_auto_update_systemd; then
+            # systemd is the authoritative path on this host — drop any cron
+            # leftover so the daily 04:00 update doesn't fire twice.
+            if [[ -f "$AUTO_UPDATE_CRON_FILE" ]]; then
+                rm -f "$AUTO_UPDATE_CRON_FILE"
+                log "Cleaned up duplicate cron entry left over from older releases"
+            fi
             return 0
         fi
         warn "systemd timer install failed — falling back to cron"
@@ -873,6 +897,17 @@ install_auto_update() {
 
     if has_cron_daemon; then
         if install_auto_update_cron; then
+            # cron is the authoritative path — tear down any stale systemd units.
+            if [[ -f "$AUTO_UPDATE_SYSTEMD_TIMER" || -f "$AUTO_UPDATE_SYSTEMD_SERVICE" ]]; then
+                if has_systemd; then
+                    systemctl disable --now kh-duo-update.timer >/dev/null 2>&1 || true
+                fi
+                rm -f "$AUTO_UPDATE_SYSTEMD_TIMER" "$AUTO_UPDATE_SYSTEMD_SERVICE"
+                if has_systemd; then
+                    systemctl daemon-reload >/dev/null 2>&1 || true
+                fi
+                log "Cleaned up duplicate systemd timer left over from older releases"
+            fi
             ok "cron entry will run daily at ${AUTO_UPDATE_HOUR}:00 (with up to 15m jitter)"
             return 0
         fi
