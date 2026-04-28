@@ -103,7 +103,8 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--bypass-local` | 对 localhost 连接绕过 Duo，默认开启。 |
 | `--no-bypass-local` | 关闭 localhost 绕过。 |
 | `--bypass-addr CIDR` | 指定额外绕过 Duo 的来源网段，可重复使用。 |
-| `--allow-password` | 允许 password + Duo 作为 fallback。 |
+| `--allow-password` | 强制开启 password + Duo fallback（即使有 SSH key）。 |
+| `--strict-publickey` | 强制 publickey-only，没找到 key 时直接 abort（不允许密码登录）。 |
 | `--skip-key-check` | 跳过 authorized_keys 检查。 |
 | `--uninstall` | 卸载 Duo SSH 2FA 并恢复 SSH 配置。 |
 | `--no-menu` | 即使在 TTY 中也不进入交互菜单。 |
@@ -152,9 +153,11 @@ sudo kh-duo
 ./install-duo-ssh.sh --check-update
 ```
 
-自更新脚本（写 `$SCRIPT_PATH`，需要 root）：
+更新脚本（写 `$SCRIPT_PATH`，需要 root）：
 
 ```bash
+sudo ./install-duo-ssh.sh --update
+# 或保留兼容性，--self-update 是 alias：
 sudo ./install-duo-ssh.sh --self-update
 ```
 
@@ -223,6 +226,19 @@ sudo ./install-duo-ssh.sh --uninstall
 ```
 
 如果配置校验或重启失败，脚本会尝试自动恢复备份并重启 SSH。
+
+### 登录方式自动检测（v1.4.0+）
+
+脚本会自动读取 `/root/.ssh/authorized_keys` 和 `$SUDO_USER` 主目录：
+
+| 现状 | 默认行为 |
+| --- | --- |
+| 找到 SSH key | publickey + Duo（password 拒绝）—— 推荐配置 |
+| 没有 SSH key | **publickey OR password + Duo**（避免管理员锁死自己），同时**大字提醒**强烈建议加 key |
+
+`--allow-password` 仍然能强制打开 password fallback（即使有 key）；`--strict-publickey` 则强制走 key-only，没有 key 时直接 abort。这两个 flag 互斥，优先级高于自动检测。
+
+向导（`sudo kh-duo` 进菜单选 1）的 Step 2/5 也会按这个逻辑选择默认值，并在没找到 key 时把"强烈建议加 key"放在最显眼的位置。
 
 ### 安全注意事项
 

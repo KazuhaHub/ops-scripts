@@ -32,7 +32,8 @@
 # Maintenance:
 #   sudo ./install-duo-ssh.sh --install-shortcut       # create /usr/local/bin/kh-duo → this script
 #        ./install-duo-ssh.sh --check-update           # read-only, no root required
-#   sudo ./install-duo-ssh.sh --self-update            # download latest and replace
+#   sudo ./install-duo-ssh.sh --update                 # download latest and replace
+#                                                        (--self-update kept as deprecated alias)
 #        ./install-duo-ssh.sh --version                # print version and exit (no root)
 #        ./install-duo-ssh.sh --show-config            # print effective update URL + sources
 #   sudo ./install-duo-ssh.sh --set-mirror <url>       # persist a custom update URL
@@ -75,6 +76,7 @@ BYPASS_LOCAL=1
 BYPASS_ADDRS=""
 ALLOW_PASSWORD=0
 SKIP_KEY_CHECK=0
+STRICT_PUBLICKEY=0
 UNINSTALL=0
 ASSUME_YES=0
 NO_MENU=0
@@ -96,7 +98,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 
 # Default canonical URL.  Persisted overrides live in $SCRIPT_CONFIG_FILE
 # (set via `--set-mirror <url>` or by editing the file as root).  See
@@ -144,10 +146,11 @@ while [[ $# -gt 0 ]]; do
         --bypass-addr)    BYPASS_ADDRS="${BYPASS_ADDRS:+$BYPASS_ADDRS,}$2"; shift 2 ;;
         --allow-password) ALLOW_PASSWORD=1; shift ;;
         --skip-key-check) SKIP_KEY_CHECK=1; shift ;;
+        --strict-publickey) STRICT_PUBLICKEY=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         --no-menu)      NO_MENU=1; shift ;;
         --check-update) ACTION_CHECK_UPDATE=1; shift ;;
-        --self-update)  ACTION_SELF_UPDATE=1; shift ;;
+        --update|--self-update) ACTION_SELF_UPDATE=1; shift ;;
         --install-shortcut) ACTION_INSTALL_SHORTCUT=1; shift ;;
         --set-mirror)   ACTION_SET_MIRROR=1; SET_MIRROR_URL="$2"; shift 2 ;;
         --clear-mirror) ACTION_CLEAR_MIRROR=1; shift ;;
@@ -233,7 +236,7 @@ set_mirror() {
     tmp="$(mktemp)" || die "mktemp failed"
     {
         echo "# Kazuha Hub Duo installer config (managed by install-duo-ssh.sh)"
-        echo "# This file is loaded before each --self-update / --check-update."
+        echo "# This file is loaded before each --update / --check-update."
         echo "# Only root can write here, so unprivileged users cannot redirect updates."
         echo ""
         echo "update_url = $url"
@@ -433,7 +436,7 @@ menu_check_and_update() {
         ok "Local $SCRIPT_VERSION is ahead of upstream $remote (development build)"
         return 0
     fi
-    warn "Update available: $SCRIPT_VERSION → $remote"
+    warn "Update available: $SCRIPT_VERSION → $remote (run 'sudo $SCRIPT_PATH --update' to install, or pick the menu option below)"
     confirm "Download and install now?" || { ok "Skipped."; return 0; }
     self_update
     ok "Re-run the script to use the new version: sudo $SCRIPT_PATH"
@@ -485,10 +488,11 @@ read_existing_config() {
     BREAKGLASS_USER="$(printf '%s\n' "$duo_block" | awk '/^[[:space:]]*Match User /{print $3; exit}')"
 }
 
-# Pretty-print current state. Caller is expected to have called
-# read_existing_config first (or this function will refresh on its own).
-show_current_config() {
-    read_existing_config
+# Pretty-print whatever is currently in the global vars.  This does NOT touch
+# disk — useful inside the adjust-settings loop where the in-memory state
+# already reflects the user's pending toggles (calling read_existing_config
+# here would clobber those toggles by overwriting them with disk values).
+print_config_summary() {
     echo
     log "Current Duo SSH configuration"
     if [[ ! -f "$PAM_DUO_CONF" || -z "$IKEY" ]]; then
@@ -505,6 +509,13 @@ show_current_config() {
 EOF
 }
 
+# Read disk state, then print.  Use this for the main menu's "Show current
+# configuration" option, where the user wants the on-disk truth.
+show_current_config() {
+    read_existing_config
+    print_config_summary
+}
+
 # Sub-menu: toggle individual settings without re-asking for credentials.
 # Returns 0 on "Apply" → caller (interactive_menu) returns to main, which then
 # runs the normal install pipeline using the updated globals.  Returns 1 (or
@@ -516,6 +527,9 @@ menu_adjust_settings() {
         return 1
     fi
 
+    # Read disk state ONCE on entry.  The loop below uses print_config_summary
+    # (no disk read) so user toggles persist in-memory across iterations and
+    # are correctly reflected in the next render.
     read_existing_config
 
     if [[ -z "$IKEY" || -z "$SKEY" || -z "$HOST" ]]; then
@@ -523,7 +537,7 @@ menu_adjust_settings() {
     fi
 
     while true; do
-        show_current_config
+        print_config_summary
         echo
         echo "Adjust which setting?"
         echo "  1) Toggle password fallback         (currently: $([[ $ALLOW_PASSWORD -eq 1 ]] && echo ON || echo OFF))"
@@ -551,7 +565,8 @@ menu_adjust_settings() {
                 ok "Breakglass user: ${BREAKGLASS_USER:-(none)}"
                 ;;
             5)
-                show_current_config
+                # Show in-memory state (NOT disk) — this is what we are about to apply.
+                print_config_summary
                 echo
                 # Bypass install_wizard prompts; install pipeline still runs normally.
                 ASSUME_YES=1
@@ -596,10 +611,40 @@ install_wizard() {
     # ── Step 2/5 — login methods ───────────────────────────────────────
     echo
     log "Step 2/5 — Login Methods"
-    echo "  Default: only publickey+Duo logins are allowed (password is rejected)."
-    echo "  Allow password+Duo as a fallback for users without SSH keys?"
-    if menu_yes_no "Allow password fallback?" "n"; then
-        ALLOW_PASSWORD=1
+
+    # Detect existing SSH keys to choose a smart default.
+    local has_keys=0
+    for home in /root "${SUDO_USER:+$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)}"; do
+        [[ -z "$home" ]] && continue
+        for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+            [[ -s "$f" ]] && { has_keys=1; break 2; }
+        done
+    done
+
+    local pw_default
+    if [[ $has_keys -eq 1 ]]; then
+        ok   "  Detected SSH key(s) — recommending publickey-only mode."
+        echo "  Allow password+Duo as a fallback for users without SSH keys?"
+        pw_default="n"
+    else
+        warn "  No SSH keys detected on this server."
+        warn "  Without a key, you can ONLY log in with password+Duo."
+        warn "  STRONGLY RECOMMENDED: add an SSH public key first, then re-run this script."
+        echo "  Defaulting to ALLOW password+Duo to prevent lockout. Force publickey-only?"
+        pw_default="y"   # default to "yes allow password" (i.e. answer "n" to the inverted "force publickey-only")
+    fi
+
+    if [[ $has_keys -eq 1 ]]; then
+        if menu_yes_no "Allow password fallback?" "$pw_default"; then
+            ALLOW_PASSWORD=1
+        fi
+    else
+        # Inverted prompt — defaults to "n" (don't force publickey-only).
+        if menu_yes_no "Force publickey-only anyway? (you WILL be locked out without keys)" "n"; then
+            ALLOW_PASSWORD=0
+        else
+            ALLOW_PASSWORD=1
+        fi
     fi
 
     # ── Step 3/5 — localhost bypass ────────────────────────────────────
@@ -833,7 +878,7 @@ sshd_service_state() {
 }
 
 check_authorized_keys() {
-    [[ $SKIP_KEY_CHECK -eq 1 ]] && { warn "Skipping authorized_keys check (--skip-key-check)"; return; }
+    [[ $SKIP_KEY_CHECK -eq 1 ]] && { warn "Skipping authorized_keys check (--skip-key-check)"; return 0; }
 
     local found=0
     for home in /root "${SUDO_USER:+$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)}"; do
@@ -845,11 +890,35 @@ check_authorized_keys() {
             fi
         done
     done
-    if [[ $found -eq 0 ]]; then
-        err "No SSH authorized_keys found for root${SUDO_USER:+ or $SUDO_USER}."
-        err "This config requires publickey auth. Add your key first, or re-run with --allow-password."
-        [[ $ALLOW_PASSWORD -eq 1 ]] || die "Aborting to prevent lockout."
+
+    if [[ $found -eq 1 ]]; then
+        # Keys present — publickey-only is safe.  Whatever ALLOW_PASSWORD was
+        # set to (default 0, or 1 from --allow-password / wizard) stays.
+        return 0
     fi
+
+    # No keys found.
+    if [[ $STRICT_PUBLICKEY -eq 1 ]]; then
+        die "No SSH authorized_keys found and --strict-publickey is set. Add a key first, or drop --strict-publickey to auto-enable password fallback."
+    fi
+
+    if [[ $ALLOW_PASSWORD -eq 1 ]]; then
+        warn "No SSH keys found — proceeding with password+key+Duo (--allow-password set)."
+        warn "STRONGLY RECOMMENDED: add an SSH public key and rerun this script to disable password fallback."
+        return 0
+    fi
+
+    # Auto-adapt: enable password fallback so admin doesn't lock themselves out.
+    warn "============================================================"
+    warn "  No SSH authorized_keys found for root${SUDO_USER:+ or $SUDO_USER}."
+    warn "  Auto-enabling password fallback (publickey OR password + Duo)."
+    warn "  Without a key, every login uses your account password + Duo."
+    warn ""
+    warn "  STRONGLY RECOMMENDED: add an SSH public key and rerun this"
+    warn "  script (or pass --strict-publickey) to switch to key-only mode."
+    warn "============================================================"
+    ALLOW_PASSWORD=1
+    return 0
 }
 
 ### ─── Package installation ──────────────────────────────────────────────
@@ -1364,7 +1433,7 @@ if [[ $ACTION_CHECK_UPDATE -eq 1 ]]; then
     elif ver_lt "$remote_ver" "$SCRIPT_VERSION"; then
         ok "Local $SCRIPT_VERSION is ahead of upstream $remote_ver (development build)"
     else
-        warn "Update available: $SCRIPT_VERSION → $remote_ver  (run sudo --self-update to apply)"
+        warn "Update available: $SCRIPT_VERSION → $remote_ver  (run sudo $0 --update to apply)"
     fi
     exit 0
 fi
@@ -1509,7 +1578,13 @@ cat <<EOF
 ║  Duo version:        $(printf '%-49s' "$(get_duo_version)")║
 ║  pam_duo.so:         $(printf '%-49s' "$PAM_DUO_SO")║
 ║  Login requirement:  $(printf '%-49s' "publickey$( [[ $ALLOW_PASSWORD -eq 1 ]] && echo ' OR password') + Duo")║
-$( [[ -n "$BREAKGLASS_USER" ]] && printf '║  Breakglass user:    %-49s║\n' "$BREAKGLASS_USER (publickey only)")
+EOF
+# Conditional row — split out of the heredoc so an empty BREAKGLASS_USER
+# doesn't leave a blank, borderless line in the box.
+if [[ -n "$BREAKGLASS_USER" ]]; then
+    printf '║  Breakglass user:    %-49s║\n' "$BREAKGLASS_USER (publickey only)"
+fi
+cat <<EOF
 ║  Backups:            $(printf '%-49s' "$BACKUP_DIR")║
 ║                                                                       ║
 ║  DO NOT CLOSE THIS SESSION YET.                                       ║
