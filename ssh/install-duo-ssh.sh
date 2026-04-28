@@ -113,7 +113,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -129,19 +129,33 @@ SCRIPT_VERSION="1.6.2"
 SCRIPT_STABLE_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
 SCRIPT_BETA_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh"
 
-# Trust anchors for the .sha256 hash file — fetched from MULTIPLE independent
-# CDNs and required to agree (quorum).  Defeats a compromised single mirror
-# that swaps the script for malicious content: the attacker would need to
-# poison ≥2 of these independent infrastructures simultaneously.  The .sha256
-# files are ~80 bytes each, so fetching from all anchors costs ~milliseconds.
-# Maintained by .github/workflows/update-sha256.yml on every push.
-HASH_ANCHORS_STABLE=(
-    "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh.sha256"
+# Trust anchors for the .sha256 hash file — TIERED model:
+#
+#   Tier 1 — canonical github (HASH_CANONICAL_*).  When reachable, this is
+#   AUTHORITATIVE: matches → accept; mismatches → refuse (CDN status irrelevant).
+#   Reasoning: github is already the source of truth for the source code, so
+#   trusting its .sha256 adds no new attack surface beyond what already exists.
+#
+#   Tier 2 — CDN fallback anchors (HASH_FALLBACK_*).  Used ONLY when canonical
+#   github is unreachable (mainland China commonly blocks raw.githubusercontent.com).
+#   All reachable fallback anchors must agree with each other AND match the
+#   downloaded content, defeating any single compromised CDN.
+#
+# Why tiered, not flat-quorum: jsDelivr/Statically use long-TTL edge caches
+# on `@<branch>` refs (~12h).  After a release push, multiple CDN edges may
+# return stale .sha256 simultaneously, outvoting fresh canonical github in a
+# flat-quorum scheme.  That's a CDN-coherence false-positive, not an attack —
+# canonical-first eliminates it without weakening the trust model.
+#
+# Maintained by .github/workflows/update-sha256.yml on every push (which also
+# purges jsDelivr cache to shrink the CDN-stale window).
+HASH_CANONICAL_STABLE="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh.sha256"
+HASH_CANONICAL_BETA="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh.sha256"
+HASH_FALLBACK_STABLE=(
     "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/install-duo-ssh.sh.sha256"
     "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh.sha256"
 )
-HASH_ANCHORS_BETA=(
-    "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh.sha256"
+HASH_FALLBACK_BETA=(
     "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@beta/ssh/install-duo-ssh.sh.sha256"
     "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh.sha256"
 )
@@ -452,40 +466,45 @@ clear_mirror() {
     fi
 }
 
-# Map effective channel to its list of independent .sha256 trust anchors.
-# Echoes one URL per line.
-channel_hash_urls() {
+# Map effective channel to its canonical .sha256 URL (Tier 1 anchor).
+canonical_hash_url() {
     case "$1" in
-        beta) printf '%s\n' "${HASH_ANCHORS_BETA[@]}" ;;
-        *)    printf '%s\n' "${HASH_ANCHORS_STABLE[@]}" ;;
+        beta) echo "$HASH_CANONICAL_BETA" ;;
+        *)    echo "$HASH_CANONICAL_STABLE" ;;
+    esac
+}
+
+# Map effective channel to its CDN fallback .sha256 URLs (Tier 2 anchors).
+fallback_hash_urls() {
+    case "$1" in
+        beta) printf '%s\n' "${HASH_FALLBACK_BETA[@]}" ;;
+        *)    printf '%s\n' "${HASH_FALLBACK_STABLE[@]}" ;;
     esac
 }
 
 # Anti-tamper SHA256 verification of a downloaded script file.
 #
-# Threat being addressed: the script was downloaded from some mirror (default
-# jsDelivr, or whatever the user configured via --set-mirror).  That mirror
-# could be compromised — attacker serves a malicious install-duo-ssh.sh.
-# Bash -n + shebang checks alone don't help (attacker writes valid bash).
-# We need a trust anchor outside the attacker's control.
+# Threat: script downloaded from some mirror (default canonical github, or a
+# CDN/mirror via --set-mirror).  A compromised mirror could serve a tampered
+# script.  Shebang + `bash -n` checks don't help (attacker writes valid bash).
 #
-# Strategy: fetch the .sha256 reference from MULTIPLE independent CDNs
-# (raw.githubusercontent.com, jsDelivr, Statically) and require all reachable
-# anchors to agree.  An attacker would have to poison ≥2 of these
-# independent infrastructures simultaneously to bypass — out-of-scope.
-# This also solves CN-network reality: raw.githubusercontent.com is often
-# unreachable from mainland China, but jsDelivr and Statically usually are,
-# so quorum still forms.
+# Tiered model:
+#   1. KH_DUO_PIN_SHA256 — out-of-band trust, highest priority.  Skips
+#      everything else.  Use case: fully-isolated host that can't reach any
+#      anchor; hash delivered via VPN/sneakernet.
 #
-# Order of trust:
-#   1. KH_DUO_PIN_SHA256 — out-of-band trust (e.g. hash carried in via VPN
-#      to a fully-isolated host that can't reach any CDN at all).  Wins
-#      over anything else.
-#   2. Multi-anchor quorum: fetch all anchors in parallel, require all
-#      reachable ones to agree.  ≥2 reachable = full confidence.  Only
-#      1 reachable = degraded (warn + accept), since at least one
-#      independent source vouches for the hash.  0 reachable = refuse,
-#      caller can set KH_DUO_PIN_SHA256 to bypass.
+#   2. Tier 1 — canonical github (raw.githubusercontent.com).  When reachable,
+#      AUTHORITATIVE: downloaded content must match its hash; CDN anchors
+#      are not consulted.  github is already the source of truth for the
+#      script's source code, so trusting its .sha256 here is the same trust
+#      boundary.  Eliminates the false-positive failure mode where multiple
+#      CDN edges return stale .sha256 simultaneously and outvote fresh github.
+#
+#   3. Tier 2 — CDN fallback quorum (jsDelivr + Statically).  Used ONLY when
+#      Tier 1 is unreachable (mainland China commonly blocks raw.github).
+#      All reachable fallback anchors must agree AND match downloaded.  Single
+#      compromised CDN cannot bypass; full quorum across independent CDNs
+#      required.
 verify_downloaded_file() {
     local file="$1"
     command -v sha256sum >/dev/null 2>&1 \
@@ -495,7 +514,7 @@ verify_downloaded_file() {
     actual_sha="$(sha256sum "$file" | awk '{print $1}')"
     log "Downloaded SHA256: $actual_sha"
 
-    # 1. Pinned hash (out-of-band trust)
+    # ── 1. PIN (out-of-band trust) ──────────────────────────────────────
     if [[ -n "${KH_DUO_PIN_SHA256:-}" ]]; then
         if [[ "$actual_sha" != "$KH_DUO_PIN_SHA256" ]]; then
             die "Anti-tamper check FAILED: pinned=$KH_DUO_PIN_SHA256 actual=$actual_sha"
@@ -504,52 +523,74 @@ verify_downloaded_file() {
         return 0
     fi
 
-    # 2. Multi-anchor quorum
-    local channel
+    local channel canonical_url
     channel="$(get_effective_channel)"
+    canonical_url="$(canonical_hash_url "$channel")"
 
-    local -a anchors
-    mapfile -t anchors < <(channel_hash_urls "$channel")
-    local total=${#anchors[@]}
+    local -a fallback_urls
+    mapfile -t fallback_urls < <(fallback_hash_urls "$channel")
+    local n_fallback=${#fallback_urls[@]}
 
-    log "Fetching SHA256 from $total independent anchor(s) in parallel..."
-
-    # Fetch all anchors in parallel into a temp dir, then collect results.
+    # Fetch canonical + all fallbacks in parallel — small files, fast.
     local tmpdir
     tmpdir="$(mktemp -d)" || die "mktemp -d failed"
-    local pid pids=() i=0
-    for url in "${anchors[@]}"; do
-        # 8s per anchor — .sha256 is ~80 bytes, anything slower is broken.
-        ( curl -fsSL --max-time 8 "$url" 2>/dev/null \
-            | awk 'NF{print $1; exit}' > "$tmpdir/$i" ) &
-        pids+=($!)
-        i=$((i+1))
+
+    log "Verifying download (canonical-first, with $n_fallback CDN fallback anchors)..."
+
+    ( curl -fsSL --max-time 8 "$canonical_url" 2>/dev/null \
+        | awk 'NF{print $1; exit}' > "$tmpdir/canonical" ) &
+    local canonical_pid=$!
+
+    local -a fb_pids
+    local i
+    for (( i=0; i<n_fallback; i++ )); do
+        ( curl -fsSL --max-time 8 "${fallback_urls[i]}" 2>/dev/null \
+            | awk 'NF{print $1; exit}' > "$tmpdir/fb_$i" ) &
+        fb_pids+=($!)
     done
-    for pid in "${pids[@]}"; do
+
+    wait "$canonical_pid" 2>/dev/null || true
+    for pid in "${fb_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
 
+    # ── 2. Tier 1: canonical github (authoritative when reachable) ──────
+    local canonical_hash
+    canonical_hash="$(cat "$tmpdir/canonical" 2>/dev/null || true)"
+    if [[ -n "$canonical_hash" ]]; then
+        rm -rf "$tmpdir"
+        if [[ "$actual_sha" == "$canonical_hash" ]]; then
+            ok "SHA256 matches canonical github (${canonical_hash:0:16}…) — CDN anchors not consulted"
+            return 0
+        fi
+        # Canonical reachable + mismatch = authoritative refusal.
+        die "Anti-tamper check FAILED — canonical github says expected=$canonical_hash, actual=$actual_sha. (Authoritative source disagrees; refusing regardless of CDN status. If you downloaded via a CDN, the CDN may be serving stale/wrong content — try 'sudo kh-duo --use-cdn github' to download from canonical.)"
+    fi
+
+    # ── 3. Tier 2: canonical unreachable, fall back to CDN quorum ───────
+    warn "Canonical github unreachable — falling back to CDN quorum ($n_fallback anchors)"
+
     local -a results=() reachable_urls=()
     local hash
-    for (( i=0; i<total; i++ )); do
-        hash="$(cat "$tmpdir/$i" 2>/dev/null || true)"
+    for (( i=0; i<n_fallback; i++ )); do
+        hash="$(cat "$tmpdir/fb_$i" 2>/dev/null || true)"
         if [[ -n "$hash" ]]; then
             results+=("$hash")
-            reachable_urls+=("${anchors[i]}")
+            reachable_urls+=("${fallback_urls[i]}")
         fi
     done
     rm -rf "$tmpdir"
 
     local reachable=${#results[@]}
     if (( reachable == 0 )); then
-        die "Anti-tamper: no trust anchor reachable (tried $total CDNs). If your network blocks all of them, set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
+        die "Anti-tamper: canonical github AND all $n_fallback CDN fallback anchors unreachable. Set KH_DUO_PIN_SHA256=<hash> for out-of-band trust, or check your network."
     fi
 
-    # All reachable anchors must agree — disagreement = possible CDN compromise
+    # All reachable fallback anchors must agree — disagreement = possible CDN compromise
     local first="${results[0]}" j
     for (( i=1; i<reachable; i++ )); do
         if [[ "${results[i]}" != "$first" ]]; then
-            err "Anti-tamper: anchors DISAGREE — possible CDN compromise."
+            err "Anti-tamper: CDN anchors DISAGREE — possible CDN compromise."
             for (( j=0; j<reachable; j++ )); do
                 err "  ${reachable_urls[j]} -> ${results[j]}"
             done
@@ -557,15 +598,15 @@ verify_downloaded_file() {
         fi
     done
 
-    if (( reachable < total )); then
-        warn "Only $reachable/$total trust anchors reachable — accepted on agreement, but consider setting KH_DUO_PIN_SHA256 for stronger guarantees."
-    fi
-
     if [[ "$actual_sha" != "$first" ]]; then
-        die "Anti-tamper check FAILED — downloaded content does not match anchor SHA256. expected=$first actual=$actual_sha"
+        die "Anti-tamper check FAILED — downloaded content does not match CDN anchor SHA256. expected=$first actual=$actual_sha"
     fi
 
-    ok "SHA256 matches $reachable/$total trust anchor(s) (${first:0:16}…)"
+    if (( reachable < n_fallback )); then
+        warn "Only $reachable/$n_fallback CDN fallback anchors reachable + canonical also unreachable — accepted on agreement, but consider setting KH_DUO_PIN_SHA256 for stronger guarantees."
+    fi
+
+    ok "SHA256 matches CDN fallback quorum ($reachable/$n_fallback anchors, canonical unreachable)"
 }
 
 # self_update / install_shortcut both treat $SCRIPT_PATH as trusted.  If the
@@ -952,6 +993,30 @@ read_existing_config() {
     BREAKGLASS_USER="$(printf '%s\n' "$duo_block" | awk '/^[[:space:]]*Match User /{print $3; exit}')"
 }
 
+# Classify a persisted mirror URL into a human-readable provider label.
+# Used by print_config_summary so users can see at a glance whether they're
+# on canonical github vs a CDN preset vs a custom URL.
+classify_mirror_url() {
+    local url="$1"
+    case "$url" in
+        "")
+            echo "canonical github  (default — no mirror configured)"
+            ;;
+        https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@*)
+            echo "jsDelivr CDN  (--use-cdn jsdelivr)"
+            ;;
+        https://cdn.statically.io/gh/KazuhaHub/ops-scripts/*)
+            echo "Statically CDN  (--use-cdn statically)"
+            ;;
+        https://raw.githubusercontent.com/KazuhaHub/ops-scripts/*)
+            echo "canonical github  (explicit override)"
+            ;;
+        *)
+            echo "custom mirror"
+            ;;
+    esac
+}
+
 # Pretty-print whatever is currently in the global vars.  This does NOT touch
 # disk — useful inside the adjust-settings loop where the in-memory state
 # already reflects the user's pending toggles (calling read_existing_config
@@ -963,9 +1028,10 @@ print_config_summary() {
         warn "  No Duo config found at $PAM_DUO_CONF — Duo is not installed yet."
         return
     fi
-    local _ch _url
+    local _ch _url _src
     _ch="$(get_effective_channel)"
     _url="$(get_persistent_url)"
+    _src="$(classify_mirror_url "$_url")"
     cat <<EOF
   Duo
     Application key:  ${IKEY:0:8}…
@@ -979,7 +1045,8 @@ print_config_summary() {
 
   Updates
     Channel:          $_ch
-    Mirror URL:       ${_url:-(none — using $_ch channel URL)}
+    Source:           $_src${_url:+
+    URL:              $_url}
     Auto-update task: $(auto_update_status)
 EOF
 }
@@ -1221,15 +1288,17 @@ EOF
 # Sub-menu: everything related to where/when updates come from.
 menu_update_settings() {
     while true; do
-        local _ch _url _auto
+        local _ch _url _src _auto
         _ch="$(get_effective_channel)"
         _url="$(get_persistent_url)"
+        _src="$(classify_mirror_url "$_url")"
         _auto="$(auto_update_status)"
 
         echo
         log "Update settings"
         echo "  Channel:          $_ch"
-        echo "  Mirror URL:       ${_url:-(none — using $_ch channel URL)}"
+        echo "  Source:           $_src"
+        [[ -n "$_url" ]] && echo "  URL:              $_url"
         echo "  Auto-update task: $_auto"
         echo
         local _toggle_label

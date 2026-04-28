@@ -271,44 +271,48 @@ update_url = https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/instal
 | **`$SCRIPT_PATH` 所有权** | `--update` 前要求脚本文件 owner 是 root。否则用户把脚本放 `/home/<user>/` 里执行就能在 root 写下去之前换文件。 |
 | **PATH pin** | 脚本顶部 `PATH=/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk/install 等不会被攻击者的 `$HOME/bin/` 同名脚本劫持。 |
 
-#### 威胁 2：镜像被攻破推恶意脚本（v1.6.0+）
+#### 威胁 2：镜像被攻破推恶意脚本（v1.6.3+ 分层信任模型）
 
-威胁场景：脚本从某个 mirror 下载（默认 jsDelivr，或 admin 用 `--set-mirror` 设的代理），mirror 被攻破，attacker 替换 `install-duo-ssh.sh`。仅靠 shebang + `bash -n` 拦不住——attacker 写合法 bash 即可。
+威胁场景：脚本从某个 mirror 下载（默认 canonical github，或 admin 用 `--use-cdn` / `--set-mirror` 设的 CDN/代理），mirror 被攻破，attacker 替换 `install-duo-ssh.sh`。仅靠 shebang + `bash -n` 拦不住——attacker 写合法 bash 即可。
 
-防御：**`.sha256` 文件并发从多个独立 CDN 拉取，要求所有可达锚点结果一致**（quorum）。
+**分层防御模型**：canonical 权威，CDN 仅做后备。
 
 ```
-download source     →  install-duo-ssh.sh        (~50KB，可能被换)
-3 independent CDNs  →  install-duo-ssh.sh.sha256 (~80B 各一份，要求全部一致)
-                       ├── raw.githubusercontent.com  (canonical)
-                       ├── cdn.jsdelivr.net           (CN 可达)
-                       └── cdn.statically.io          (CN 可达)
+                ┌──────────────────────────────────────────────────────┐
+  Tier 1   →    │  raw.githubusercontent.com/.../install-duo-ssh.sh.sha256 │
+                │  AUTHORITATIVE — 可达即一锤定音                       │
+                └──────────────────────────────────────────────────────┘
+                           ↓ (canonical 不可达时才往下)
+                ┌──────────────────────────────────────────────────────┐
+  Tier 2   →    │  cdn.jsdelivr.net + cdn.statically.io                │
+                │  CDN fallback quorum — 全部可达 anchor 必须一致      │
+                │  专门解决 CN 网络封 raw.github 的场景                │
+                └──────────────────────────────────────────────────────┘
 ```
 
 设计要点：
 
-- **三个 CDN 完全独立**——分别由 GitHub、Cloudflare/Fastly、独立运营商承载。攻击者要绕过 quorum，得**同时**污染至少两个完全独立的基础设施。
-- **CN 大陆友好**——即使 raw.githubusercontent.com 被墙，jsDelivr + Statically 通常还能形成 quorum。0 个可达时才退到要求 `KH_DUO_PIN_SHA256` 的离线模式。
-- **任意两个 anchor 不一致 → 立即拒绝** 并打印每个 anchor 返回的 hash，方便事故定位。
-- **3 个并发拉取**，每个 8s 超时；总耗时 < 1 秒。
+- **canonical 权威**：raw.github 已经是源代码本身的 source of truth，它的 `.sha256` 就是同一个信任边界。可达且匹配 → 立刻通过；可达但不匹配 → **直接拒绝**（不再咨询 CDN，避免 CDN 缓存陈旧"投票颠覆"权威源的失败模式）。
+- **CDN 只做 fallback**：仅当 raw.github 不可达（CN 大陆典型场景）才退到 CDN quorum。jsDelivr + Statically 都返回 hash 且一致 → 通过；不一致 → 拒绝。
+- **为什么不简单用扁平 quorum**：jsDelivr / Statically 的 `@<branch>` 边缘缓存有 ~12h TTL。每次 release push 后，多个 CDN 边缘可能同时返回陈旧 `.sha256`，反而以多数派压过新鲜的 raw.github——这是 CDN 一致性问题，不是攻击。分层模型从源头消除这个 false positive。
+- **3 个 anchor 并发拉取**，每个 8s 超时；总耗时 < 1 秒。
 
-`.sha256` 由 GitHub Actions ([.github/workflows/update-sha256.yml](../.github/workflows/update-sha256.yml)) 在每次 `install-duo-ssh.sh` 提交后自动重生。jsDelivr / Statically 都直接镜像 GitHub 内容，无需单独发布。
+`.sha256` 由 GitHub Actions ([.github/workflows/update-sha256.yml](../.github/workflows/update-sha256.yml)) 在每次 `install-duo-ssh.sh` 提交后自动重生，并**主动调用 jsDelivr 的 purge API** 让 CDN 边缘尽快刷新（异步、尽力而为，不阻塞）。
 
 信任优先级（高到低）：
 
-1. **`KH_DUO_PIN_SHA256` 环境变量** —— 带外信任，最高优先级。适合**3 个 CDN 全部不可达** 的极端隔离环境，hash 通过 VPN/sneakernet 拿到后塞 env 里。
-2. **多锚点 quorum** —— 默认行为。并发拉 3 个 anchor 的 `.sha256`，所有可达的必须一致；本地 hash 必须匹配该值。
-   - 3/3 可达 → ok
-   - 2/3 或 1/3 可达 → warn 并通过（提示考虑设 PIN 加强）
-   - 0/3 可达 → 拒绝（要求 PIN）
+1. **`KH_DUO_PIN_SHA256` 环境变量** —— 带外信任，最高优先级。适合**所有 anchor 全不可达** 的极端隔离环境，hash 通过 VPN/sneakernet 拿到后塞 env 里。
+2. **Tier 1：raw.github canonical** —— 可达即权威。匹配则通过，不匹配立即拒（明确建议用 `--use-cdn github` 重新走 canonical 下载）。
+3. **Tier 2：CDN fallback quorum** —— 仅 Tier 1 不可达时启用。所有可达 fallback anchor 必须一致 + 匹配下载内容。
 
 | 攻击者控制 | 结果 |
 |---|---|
-| 任一单一 CDN（含默认 jsDelivr）被攻破，其他正常 | ❌ 拒绝（anchors disagree） |
-| 用户自定义 `--set-mirror` 被攻破 | ❌ 拒绝（mirror 服务的脚本 hash 与 3 个 anchor 不匹配） |
-| 同时控制 ≥2 个独立 CDN | ⚠️ 绕过（out-of-scope，建议设 PIN） |
-| 同时控制 GitHub 仓库本身（PAT 泄露） | ⚠️ 绕过（attacker 改源 + 改 anchor，所有 anchor 同步污染。建议 GitHub 账号开 2FA + 关键变更走人审 release） |
+| 任一单一 CDN（默认下载源被攻破） | ❌ 拒绝（Tier 1 raw.github 权威不匹配） |
+| 用户自定义 `--set-mirror` 被攻破 | ❌ 拒绝（同上） |
+| 同时攻破 jsDelivr 和 Statically（且 CN 用户 raw.github 不可达） | ⚠️ 绕过（out-of-scope，建议设 PIN） |
+| 同时控制 GitHub 仓库本身（PAT 泄露） | ⚠️ 绕过（建议 GitHub 账号开 2FA + 关键变更走人审 release） |
 | 本地 `KH_DUO_PIN_SHA256` 被普通用户篡改 | ❌ 拒绝（sudo 上下文 env 被忽略） |
+| CDN 缓存陈旧（v1.6.2 老 bug） | ✅ 不再误报（Tier 1 直接拍板，不看 CDN） |
 
 ### 卸载
 

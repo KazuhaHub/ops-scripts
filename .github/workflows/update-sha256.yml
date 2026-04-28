@@ -1,9 +1,14 @@
 name: Update SHA256 anchors
 
-# Maintain ssh/install-duo-ssh.sh.sha256 alongside the script.  This file is
-# fetched from canonical github.com by every host doing --update via a custom
-# mirror, so a compromised mirror cannot pass the anti-tamper check unless it
-# can also tamper with this hash file (which lives at github.com).
+# Maintain ssh/install-duo-ssh.sh.sha256 alongside the script.  Hosts doing
+# --update fetch this file as the canonical trust anchor; mirrors must serve
+# matching content or be rejected.
+#
+# Also purges the jsDelivr CDN cache for both files after the commit lands,
+# so CN users hitting jsDelivr don't see stale content for hours after a
+# release (jsDelivr's `@<branch>` refs cache for ~12h by default, and the
+# stale window is exactly when CDN-using hosts try to upgrade to whatever
+# we just pushed).
 #
 # Triggers on every push to master and beta that touches the script.  The
 # job's own commit ends with [skip ci] so it doesn't loop.
@@ -45,3 +50,24 @@ jobs:
           short=$(git rev-parse --short HEAD)
           git commit -m "Update SHA256 for install-duo-ssh.sh @ $short [skip ci]"
           git push origin "${{ github.ref_name }}"
+
+      - name: Purge jsDelivr CDN cache
+        if: always()
+        run: |
+          # Purge BOTH the script and its .sha256 from jsDelivr so the next
+          # CDN-using host fetching either file gets the fresh content.  This
+          # is best-effort — propagation across all edge PoPs is async and
+          # can still take minutes — but it dramatically shrinks the window
+          # during which the multi-anchor verifier sees disagreement.
+          #
+          # The purge endpoint is public, no auth, idempotent.  Failing here
+          # is non-fatal (the .sha256 commit already landed; verification
+          # falls back to canonical github which has no CDN cache).
+          set -uo pipefail
+          BRANCH="${{ github.ref_name }}"
+          for path in ssh/install-duo-ssh.sh ssh/install-duo-ssh.sh.sha256; do
+            url="https://purge.jsdelivr.net/gh/KazuhaHub/ops-scripts@${BRANCH}/${path}"
+            echo "Purging $url"
+            curl -fsS --max-time 15 "$url" || echo "(purge call failed — non-fatal)"
+            echo
+          done

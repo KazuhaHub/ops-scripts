@@ -47,7 +47,7 @@ set -euo pipefail
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
-BOOTSTRAP_VERSION="1.2.0"
+BOOTSTRAP_VERSION="1.2.1"
 
 # Strip our own --channel <name> and --cdn <provider> from $@ before we
 # forward the rest to install-duo-ssh.sh (which has its own --set-channel /
@@ -108,13 +108,23 @@ SCRIPT_NAME="install-duo-ssh.sh"
 INSTALL_DIR="/usr/local/sbin"
 TARGET="$INSTALL_DIR/$SCRIPT_NAME"
 
-# Multi-anchor SHA256 trust anchors — same design as install-duo-ssh.sh's
-# verify_downloaded_file().  We fetch all 3 in parallel and require all
-# reachable ones to agree.  Fixes both the original "single anchor" gap and
-# the CN-reachability problem (jsDelivr + Statically usually form quorum
-# even when raw.github is blocked).
-HASH_ANCHORS=(
-    "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/$BRANCH/ssh/$SCRIPT_NAME.sha256"
+# SHA256 trust anchors — TIERED model, same as install-duo-ssh.sh:
+#
+#   Tier 1 (canonical): authoritative when reachable.  github raw is the
+#   source of truth for the script itself, so its .sha256 is the same
+#   trust boundary.
+#
+#   Tier 2 (CDN fallback): used ONLY when canonical is unreachable
+#   (mainland China commonly blocks raw.github).  All reachable fallback
+#   anchors must agree AND match downloaded content.
+#
+# Why tiered: jsDelivr/Statically `@<branch>` refs cache for hours per edge
+# PoP.  After a release push, multiple CDN edges may serve stale .sha256
+# simultaneously and outvote fresh canonical github in a flat-quorum scheme.
+# That's a CDN-coherence false-positive, not an attack.  Canonical-first
+# eliminates it without weakening the trust model.
+HASH_CANONICAL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/$BRANCH/ssh/$SCRIPT_NAME.sha256"
+HASH_FALLBACK_URLS=(
     "https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@$BRANCH/ssh/$SCRIPT_NAME.sha256"
     "https://cdn.statically.io/gh/KazuhaHub/ops-scripts/$BRANCH/ssh/$SCRIPT_NAME.sha256"
 )
@@ -166,13 +176,11 @@ bash -n "$tmp" 2>/dev/null \
 new_version="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$tmp")"
 [[ -n "$new_version" ]] || warn "Could not parse SCRIPT_VERSION from downloaded file"
 
-### ─── Anti-tamper SHA256 quorum check ────────────────────────────────────
-# Compute local hash, then fetch .sha256 from every trust anchor in parallel
-# and require all reachable ones to agree.  An attacker has to compromise
-# ≥2 independent CDNs (raw.github + jsDelivr + Statically) to bypass.
-#
-# KH_DUO_PIN_SHA256 short-circuits this with out-of-band trust — useful for
-# fully-isolated hosts that can't reach any CDN at all.
+### ─── Anti-tamper SHA256 (tiered: canonical-first, CDN fallback) ─────────
+# Tier 1 (canonical github): authoritative when reachable.
+# Tier 2 (CDN fallback):     used only when Tier 1 unreachable; quorum
+#                            across reachable fallback anchors required.
+# KH_DUO_PIN_SHA256 short-circuits both — useful for fully-isolated hosts.
 actual_sha="$(sha256sum "$tmp" | awk '{print $1}')"
 log "Downloaded SHA256: $actual_sha"
 
@@ -182,55 +190,79 @@ if [[ -n "${KH_DUO_PIN_SHA256:-}" ]]; then
     fi
     ok "SHA256 matches KH_DUO_PIN_SHA256"
 else
-    log "Fetching SHA256 from ${#HASH_ANCHORS[@]} independent anchor(s) in parallel..."
+    n_fallback=${#HASH_FALLBACK_URLS[@]}
+    log "Verifying download (canonical-first, with $n_fallback CDN fallback anchor(s))..."
+
     anchor_dir="$(mktemp -d)" || die "mktemp -d failed"
-    pids=()
-    i=0
-    for url in "${HASH_ANCHORS[@]}"; do
-        ( curl -fsSL --max-time 8 "$url" 2>/dev/null \
-            | awk 'NF{print $1; exit}' > "$anchor_dir/$i" ) &
-        pids+=($!)
-        i=$((i+1))
+
+    ( curl -fsSL --max-time 8 "$HASH_CANONICAL" 2>/dev/null \
+        | awk 'NF{print $1; exit}' > "$anchor_dir/canonical" ) &
+    canonical_pid=$!
+
+    fb_pids=()
+    for (( i=0; i<n_fallback; i++ )); do
+        ( curl -fsSL --max-time 8 "${HASH_FALLBACK_URLS[i]}" 2>/dev/null \
+            | awk 'NF{print $1; exit}' > "$anchor_dir/fb_$i" ) &
+        fb_pids+=($!)
     done
-    for pid in "${pids[@]}"; do
+
+    wait "$canonical_pid" 2>/dev/null || true
+    for pid in "${fb_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
 
-    results=()
-    reachable_urls=()
-    for (( i=0; i<${#HASH_ANCHORS[@]}; i++ )); do
-        h="$(cat "$anchor_dir/$i" 2>/dev/null || true)"
-        if [[ -n "$h" ]]; then
-            results+=("$h")
-            reachable_urls+=("${HASH_ANCHORS[i]}")
+    # Tier 1: canonical (authoritative)
+    canonical_hash="$(cat "$anchor_dir/canonical" 2>/dev/null || true)"
+    if [[ -n "$canonical_hash" ]]; then
+        rm -rf "$anchor_dir"
+        if [[ "$actual_sha" == "$canonical_hash" ]]; then
+            ok "SHA256 matches canonical github (${canonical_hash:0:16}…) — CDN anchors not consulted"
+        else
+            err "Anti-tamper FAILED — canonical github says expected=$canonical_hash, actual=$actual_sha"
+            err "(Authoritative source disagrees; refusing regardless of CDN status."
+            err " If you bootstrapped via a CDN, the CDN may be serving stale/wrong content."
+            err " Try the canonical github URL: 'curl -fsSL https://raw.githubusercontent.com/KazuhaHub/ops-scripts/$BRANCH/ssh/install.sh | sudo bash')"
+            exit 1
         fi
-    done
-    rm -rf "$anchor_dir"
+    else
+        # Tier 2: canonical unreachable → fallback quorum
+        warn "Canonical github unreachable — falling back to CDN quorum ($n_fallback anchors)"
+        results=()
+        reachable_urls=()
+        for (( i=0; i<n_fallback; i++ )); do
+            h="$(cat "$anchor_dir/fb_$i" 2>/dev/null || true)"
+            if [[ -n "$h" ]]; then
+                results+=("$h")
+                reachable_urls+=("${HASH_FALLBACK_URLS[i]}")
+            fi
+        done
+        rm -rf "$anchor_dir"
 
-    if [[ ${#results[@]} -eq 0 ]]; then
-        die "Anti-tamper: no trust anchor reachable (tried ${#HASH_ANCHORS[@]} CDNs). Set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
-    fi
-
-    first="${results[0]}"
-    for (( i=1; i<${#results[@]}; i++ )); do
-        if [[ "${results[i]}" != "$first" ]]; then
-            err "Anti-tamper: anchors DISAGREE — possible CDN compromise."
-            for (( j=0; j<${#results[@]}; j++ )); do
-                err "  ${reachable_urls[j]} -> ${results[j]}"
-            done
-            die "Refusing to install with conflicting trust anchors."
+        if [[ ${#results[@]} -eq 0 ]]; then
+            die "Anti-tamper: canonical github AND all $n_fallback CDN fallback anchors unreachable. Set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
         fi
-    done
 
-    if [[ ${#results[@]} -lt ${#HASH_ANCHORS[@]} ]]; then
-        warn "Only ${#results[@]}/${#HASH_ANCHORS[@]} trust anchors reachable — accepted on agreement."
+        first="${results[0]}"
+        for (( i=1; i<${#results[@]}; i++ )); do
+            if [[ "${results[i]}" != "$first" ]]; then
+                err "Anti-tamper: CDN anchors DISAGREE — possible CDN compromise."
+                for (( j=0; j<${#results[@]}; j++ )); do
+                    err "  ${reachable_urls[j]} -> ${results[j]}"
+                done
+                die "Refusing to install with conflicting trust anchors."
+            fi
+        done
+
+        if [[ "$actual_sha" != "$first" ]]; then
+            die "Anti-tamper FAILED — downloaded content does not match CDN anchor SHA256. expected=$first actual=$actual_sha"
+        fi
+
+        if [[ ${#results[@]} -lt $n_fallback ]]; then
+            warn "Only ${#results[@]}/$n_fallback CDN fallback anchors reachable + canonical also unreachable — accepted on agreement."
+        fi
+
+        ok "SHA256 matches CDN fallback quorum (${#results[@]}/$n_fallback anchors, canonical unreachable)"
     fi
-
-    if [[ "$actual_sha" != "$first" ]]; then
-        die "Anti-tamper check FAILED — downloaded content does not match anchor SHA256. expected=$first actual=$actual_sha"
-    fi
-
-    ok "SHA256 matches ${#results[@]}/${#HASH_ANCHORS[@]} trust anchor(s) (${first:0:16}…)"
 fi
 
 ### ─── Install ────────────────────────────────────────────────────────────
