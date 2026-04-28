@@ -200,17 +200,41 @@ update_url = https://ghfast.top/https://raw.githubusercontent.com/KazuhaHub/ops-
 
 ### 防篡改设计
 
-威胁模型：**本地非特权用户**想让 root 的 `--self-update` 跑攻击者控制的脚本。
+两个独立威胁，分别防：
 
-防御层（按生效顺序）：
+#### 威胁 1：本地非特权用户篡改
 
 | 层 | 怎么防 |
 |---|---|
-| **URL 来源** | 优先读 `/etc/duo/install-duo-ssh.conf`（root-owned 600）。`KH_DUO_UPDATE_URL` 在 sudo 上下文（`SUDO_USER` 非空）被拒，避免 `sudo -E KH_DUO_UPDATE_URL=evil kh-duo` 攻击。 |
-| **`$SCRIPT_PATH` 所有权** | `--self-update` 前要求当前脚本文件 owner 是 root。否则用户把脚本放 `/home/<user>/` 里执行就能在 root 写下去之前换文件。 |
-| **下载内容校验** | 必须以 `#!/bin/bash`/`#!/usr/bin/env bash` 开头，且能通过 `bash -n` 语法检查。下成 GitHub HTML 错误页或半截文件直接拒绝。 |
-| **可选 SHA256 pin** | 设 `KH_DUO_PIN_SHA256=<expected hash>`，下载内容必须匹配。适合完全连不上 GitHub、需要带外（VPN/sneakernet）确认 hash 的场景。 |
-| **PATH pin** | 脚本顶部 `PATH=/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk/install 等命令不会被攻击者放在 `$HOME/bin/` 的同名脚本劫持。 |
+| **URL 来源** | 优先读 `/etc/duo/install-duo-ssh.conf`（root-owned 600）。`KH_DUO_UPDATE_URL` / `KH_DUO_CHANNEL` 在 sudo 上下文（`SUDO_USER` 非空）被拒，避免 `sudo -E KH_DUO_UPDATE_URL=evil kh-duo` 攻击。 |
+| **`$SCRIPT_PATH` 所有权** | `--update` 前要求脚本文件 owner 是 root。否则用户把脚本放 `/home/<user>/` 里执行就能在 root 写下去之前换文件。 |
+| **PATH pin** | 脚本顶部 `PATH=/usr/sbin:/usr/bin:/sbin:/bin`，curl/awk/install 等不会被攻击者的 `$HOME/bin/` 同名脚本劫持。 |
+
+#### 威胁 2：镜像被攻破推恶意脚本（v1.5.3+）
+
+威胁场景：admin 设了 `--set-mirror https://ghproxy.com/...`，mirror 被攻破，attacker 替换 `install-duo-ssh.sh`。仅靠 shebang + `bash -n` 拦不住——attacker 写合法 bash 即可。
+
+防御：**SHA256 锚点固定从 canonical github.com 取**。即使 admin 用 mirror 拉脚本，`.sha256` 文件永远从 GitHub 直接下载（80 字节小文件，CN 弱网也能抓）。
+
+```
+mirror serves   →  install-duo-ssh.sh           (~50KB，可能被换)
+canonical serves →  install-duo-ssh.sh.sha256   (~80B，attacker 控制不了)
+```
+
+`.sha256` 由 GitHub Actions ([.github/workflows/update-sha256.yml](../.github/workflows/update-sha256.yml)) 在每次 `install-duo-ssh.sh` 提交后自动重生。
+
+信任优先级（高到低）：
+
+1. **`KH_DUO_PIN_SHA256` 环境变量** —— 带外信任，最高优先级。适合**完全连不上 GitHub 任何域名** 的场景，hash 通过 VPN/sneakernet 拿到后塞 env 里。
+2. **直接用 canonical URL 下载** —— 没用 mirror 时跳过 cross-check（github 自身就是信任源）。
+3. **Mirror + canonical `.sha256` 对比** —— 默认行为。从 mirror 拉脚本，从 github.com 拉 `.sha256`，本地算 hash 对比。不匹配直接拒绝；canonical 不可达且未设 PIN → 拒绝（避免静默不验证）。
+
+| 攻击者控制 | 结果 |
+|---|---|
+| Mirror 被攻破，github.com 正常 | ❌ 拒绝（hash 不匹配） |
+| github.com `.sha256` 文件，mirror 正常 | ❌ 拒绝（attacker 不太可能控制 github） |
+| 同时控制 mirror 和 github.com | ⚠️ 绕过（out-of-scope，需要 PIN） |
+| 本地 `KH_DUO_PIN_SHA256` 被普通用户篡改 | ❌ 拒绝（sudo 上下文 env 被忽略） |
 
 ### 卸载
 

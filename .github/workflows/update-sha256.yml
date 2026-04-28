@@ -1,0 +1,47 @@
+name: Update SHA256 anchors
+
+# Maintain ssh/install-duo-ssh.sh.sha256 alongside the script.  This file is
+# fetched from canonical github.com by every host doing --update via a custom
+# mirror, so a compromised mirror cannot pass the anti-tamper check unless it
+# can also tamper with this hash file (which lives at github.com).
+#
+# Triggers on every push to master and beta that touches the script.  The
+# job's own commit ends with [skip ci] so it doesn't loop.
+
+on:
+  push:
+    branches: [master, beta]
+    paths: ['ssh/install-duo-ssh.sh']
+
+jobs:
+  update-hash:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute SHA256
+        run: |
+          set -euo pipefail
+          HASH=$(sha256sum ssh/install-duo-ssh.sh | awk '{print $1}')
+          printf '%s  install-duo-ssh.sh\n' "$HASH" > ssh/install-duo-ssh.sh.sha256
+          echo "New hash: $HASH"
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet ssh/install-duo-ssh.sh.sha256; then
+            echo "Hash unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name  "ops-scripts ci"
+          git config user.email "noreply@kazuha-hub.invalid"
+          git add ssh/install-duo-ssh.sh.sha256
+          short=$(git rev-parse --short HEAD)
+          git commit -m "Update SHA256 for install-duo-ssh.sh @ $short [skip ci]"
+          git push origin "${{ github.ref_name }}"

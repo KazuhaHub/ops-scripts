@@ -109,7 +109,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -117,6 +117,14 @@ SCRIPT_VERSION="1.5.2"
 # the rest of the fleet picks them up at the next 04:00 cycle.
 SCRIPT_STABLE_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh"
 SCRIPT_BETA_URL="https://raw.githubusercontent.com/KazuhaHub/ops-scripts/beta/ssh/install-duo-ssh.sh"
+
+# Canonical SHA256 hash files — fetched from GitHub directly even when a mirror
+# serves the bulk download.  Defeats a compromised mirror that swaps the script
+# for malicious content: the hash anchor lives at github.com, which the
+# attacker doesn't control.  Maintained by .github/workflows/update-sha256.yml
+# on every push to master / beta.
+SCRIPT_STABLE_HASH_URL="${SCRIPT_STABLE_URL}.sha256"
+SCRIPT_BETA_HASH_URL="${SCRIPT_BETA_URL}.sha256"
 SCRIPT_DEFAULT_URL="$SCRIPT_STABLE_URL"   # back-compat var name; kept for log messages
 
 # Per-host config file owned by root, mode 600.  Only root can write here, so
@@ -366,20 +374,77 @@ clear_mirror() {
     fi
 }
 
-# Optional SHA256 pin for out-of-band trust (e.g. hosts that cannot reach
-# GitHub at all and want to verify a known-good hash from sneakernet).
-verify_pinned_sha256() {
-    local file="$1"
-    [[ -z "${KH_DUO_PIN_SHA256:-}" ]] && return 0
+# Map effective channel to its canonical .sha256 URL.
+channel_hash_url() {
+    case "$1" in
+        beta) echo "$SCRIPT_BETA_HASH_URL" ;;
+        *)    echo "$SCRIPT_STABLE_HASH_URL" ;;
+    esac
+}
 
-    command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found — required for KH_DUO_PIN_SHA256"
+# Anti-tamper SHA256 verification of a downloaded script file.
+#
+# Threat being addressed: the user has set --set-mirror to a custom proxy
+# (e.g. ghproxy.com for CN), and the mirror gets compromised — attacker
+# pushes a malicious install-duo-ssh.sh through the mirror.  Bash -n + shebang
+# checks alone don't help (attacker writes valid bash).  We need a trust
+# anchor that the attacker doesn't control.
+#
+# Strategy: pull the .sha256 reference from canonical github.com regardless
+# of where the bulk download came from.  Attacker would have to compromise
+# both the mirror AND github.com to bypass — out-of-scope for this design.
+#
+# Order of trust:
+#   1. KH_DUO_PIN_SHA256 — out-of-band trust (e.g. hash carried in via VPN
+#      to a fully-isolated host that can't reach github at all).  Wins
+#      over anything else.
+#   2. If we already downloaded directly from canonical (no mirror), no
+#      cross-check is needed — the source IS the trust anchor.
+#   3. Otherwise (mirror is in use): MUST fetch canonical .sha256 and
+#      compare.  Refuse if canonical is unreachable, since we have no way
+#      to anchor trust — caller can set KH_DUO_PIN_SHA256 to bypass.
+verify_downloaded_file() {
+    local file="$1"
+    command -v sha256sum >/dev/null 2>&1 \
+        || die "sha256sum required for anti-tamper verification"
 
     local actual_sha
     actual_sha="$(sha256sum "$file" | awk '{print $1}')"
-    if [[ "$actual_sha" != "$KH_DUO_PIN_SHA256" ]]; then
-        die "SHA256 pin check FAILED: pinned=$KH_DUO_PIN_SHA256 actual=$actual_sha"
+    log "Downloaded SHA256: $actual_sha"
+
+    # 1. Pinned hash (out-of-band trust)
+    if [[ -n "${KH_DUO_PIN_SHA256:-}" ]]; then
+        if [[ "$actual_sha" != "$KH_DUO_PIN_SHA256" ]]; then
+            die "Anti-tamper check FAILED: pinned=$KH_DUO_PIN_SHA256 actual=$actual_sha"
+        fi
+        ok "SHA256 matches KH_DUO_PIN_SHA256"
+        return 0
     fi
-    ok "SHA256 matches KH_DUO_PIN_SHA256 ($actual_sha)"
+
+    # 2. Downloaded directly from canonical -> no cross-check needed
+    local channel canonical_url
+    channel="$(get_effective_channel)"
+    canonical_url="$(channel_url "$channel")"
+    if [[ "$SCRIPT_RAW_URL" == "$canonical_url" ]]; then
+        return 0
+    fi
+
+    # 3. Mirror in use -> fetch canonical .sha256 to anchor trust
+    local hash_url expected_sha
+    hash_url="$(channel_hash_url "$channel")"
+    log "Mirror in use — fetching canonical SHA256 from $hash_url"
+    expected_sha="$(curl -fsSL --max-time 15 "$hash_url" 2>/dev/null \
+                    | awk 'NF{print $1; exit}')"
+
+    if [[ -z "$expected_sha" ]]; then
+        die "Anti-tamper: cannot reach canonical SHA256 ($hash_url). The .sha256 file is ~80 bytes and should be reachable even on slow links — if your network blocks github.com entirely, set KH_DUO_PIN_SHA256=<hash> for out-of-band trust."
+    fi
+
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        die "Anti-tamper check FAILED — mirror returned tampered content. canonical=$expected_sha actual=$actual_sha"
+    fi
+
+    ok "SHA256 matches canonical (${expected_sha:0:16}…)"
 }
 
 # self_update / install_shortcut both treat $SCRIPT_PATH as trusted.  If the
@@ -428,7 +493,7 @@ self_update() {
     bash -n "$tmp" 2>/dev/null || {
         rm -f "$tmp"; die "Downloaded file failed syntax check — refusing to install"
     }
-    verify_pinned_sha256 "$tmp" || { rm -f "$tmp"; die "SHA256 pin verification failed"; }
+    verify_downloaded_file "$tmp" || { rm -f "$tmp"; die "Anti-tamper verification failed"; }
     local backup="${SCRIPT_PATH}.bak.${TS}"
     cp -a "$SCRIPT_PATH" "$backup" || die "Backup of current script failed"
     if ! install -m 755 "$tmp" "$SCRIPT_PATH" 2>/dev/null; then
