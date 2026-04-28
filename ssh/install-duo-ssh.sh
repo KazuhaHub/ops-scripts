@@ -84,7 +84,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 SCRIPT_TRUSTED_URL_PREFIX="https://raw.githubusercontent.com/"
 SCRIPT_RAW_URL="${KH_DUO_UPDATE_URL:-https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/ssh/install-duo-ssh.sh}"
 SHORTCUT_PATH="${KH_DUO_SHORTCUT:-/usr/local/bin/kh-duo}"
@@ -547,7 +547,7 @@ interactive_menu() {
     cat <<BANNER
 
 ╔═══════════════════════════════════════════════════════════════════════╗
-║         Duo 2FA for SSH — Interactive Setup                          ║
+║         Duo 2FA for SSH — Interactive Setup                           ║
 ╚═══════════════════════════════════════════════════════════════════════╝
   install-duo-ssh.sh v${SCRIPT_VERSION}   (use --no-menu or any flag to skip the wizard)
 BANNER
@@ -1146,9 +1146,10 @@ PYEOF
         fi
     } >> "$SSHD_CONFIG"
     ok "Added AuthenticationMethods"
-    [[ $BYPASS_LOCAL -eq 1 ]] && ok "Bypass Duo for localhost and self connections"
-    [[ -n "$BYPASS_ADDRS" ]] && ok "Bypass Duo for: $BYPASS_ADDRS"
-    [[ -n "$BREAKGLASS_USER" ]] && ok "Breakglass user: $BREAKGLASS_USER (bypasses Duo)"
+    if [[ $BYPASS_LOCAL -eq 1 ]];      then ok "Bypass Duo for localhost and self connections"; fi
+    if [[ -n "$BYPASS_ADDRS" ]];       then ok "Bypass Duo for: $BYPASS_ADDRS"; fi
+    if [[ -n "$BREAKGLASS_USER" ]];    then ok "Breakglass user: $BREAKGLASS_USER (bypasses Duo)"; fi
+    return 0   # explicit success — bare `[[ ]] && ...` chains above can leak a non-zero exit when all conditions are false, which set -e would treat as a function failure and roll back the whole install
 }
 
 ### ─── SELinux (RHEL only) ───────────────────────────────────────────────
