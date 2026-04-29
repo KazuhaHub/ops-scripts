@@ -125,7 +125,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1525,8 +1525,8 @@ ensure_python3() {
     log "Installing python3 (required for safe PAM/sshd_config patching)"
     if [[ "$OS_FAMILY" == "debian" ]]; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y python3 >/dev/null
+        apt_get update -qq
+        apt_get install -y python3 >/dev/null
     elif [[ "$OS_FAMILY" == "rhel" ]]; then
         $PKG_MGR install -y python3 >/dev/null
     fi
@@ -1702,9 +1702,20 @@ check_authorized_keys() {
 }
 
 ### ─── Package installation ──────────────────────────────────────────────
+# apt-get wrapper that waits up to 2 minutes for the dpkg lock instead of
+# failing immediately.  Without this, --reinstall hits a race: Phase 1's
+# `apt-get remove duo-unix` releases the lock; before Phase 2 grabs it,
+# Debian's apt-daily.timer (or unattended-upgrades) can sneak in and hold
+# the lock for several minutes — Phase 2's `apt-get install` then dies and
+# leaves the host with sshd_config Duo block already torn down by Phase 1
+# but no Duo binary back in place.  DPkg::Lock::Timeout is supported by
+# apt 1.9.11+ (Debian 12 has 2.6+, Ubuntu 20.04+ has 2.0+, all fine).
+APT_GET_OPTS=(-o DPkg::Lock::Timeout=120)
+apt_get() { apt-get "${APT_GET_OPTS[@]}" "$@"; }
+
 install_duo_apt() {
     log "Adding Duo official APT repository (pkg.duosecurity.com)"
-    apt-get install -y -qq apt-transport-https curl gnupg >/dev/null 2>&1
+    apt_get install -y -qq apt-transport-https curl gnupg >/dev/null 2>&1
 
     curl -sSL https://duo.com/DUO-GPG-PUBLIC-KEY.asc | gpg --dearmor -o /usr/share/keyrings/duo-archive-keyring.gpg
 
@@ -1733,8 +1744,8 @@ install_duo_apt() {
     ok "Added Duo repo: ${repo_url} ${codename}"
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y duo-unix
+    apt_get update -qq
+    apt_get install -y duo-unix
 }
 
 install_duo_yum() {
@@ -1780,7 +1791,7 @@ remove_old_packages() {
     if [[ "$OS_FAMILY" == "debian" ]]; then
         if dpkg -l libpam-duo 2>/dev/null | grep -q '^ii'; then
             warn "Removing outdated libpam-duo from distro repo"
-            apt-get remove -y libpam-duo libduo3 >/dev/null 2>&1 || true
+            apt_get remove -y libpam-duo libduo3 >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -2011,8 +2022,8 @@ PYEOF
 
     # Remove packages and repos
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        dpkg -l duo-unix 2>/dev/null | grep -q '^ii' && apt-get remove -y duo-unix >/dev/null 2>&1 || true
-        dpkg -l libpam-duo 2>/dev/null | grep -q '^ii' && apt-get remove -y libpam-duo libduo3 >/dev/null 2>&1 || true
+        dpkg -l duo-unix    2>/dev/null | grep -q '^ii' && apt_get remove -y duo-unix              >/dev/null 2>&1 || true
+        dpkg -l libpam-duo  2>/dev/null | grep -q '^ii' && apt_get remove -y libpam-duo libduo3    >/dev/null 2>&1 || true
         rm -f /etc/apt/sources.list.d/duosecurity.list
         rm -f /usr/share/keyrings/duo-archive-keyring.gpg
     elif [[ "$OS_FAMILY" == "rhel" ]]; then
