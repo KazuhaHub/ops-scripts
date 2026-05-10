@@ -26,6 +26,10 @@
 #   sudo ./install-duo-ssh.sh --no-bypass-local         # disable default localhost bypass
 #   sudo ./install-duo-ssh.sh --bypass-addr 10.0.0.0/8 # extra CIDRs to bypass Duo
 #   sudo ./install-duo-ssh.sh --allow-password         # also allow password+Duo via PAM (publickey users still skip password)
+#   sudo ./install-duo-ssh.sh --failmode safe          # default — when Duo cloud is unreachable,
+#                                                        let publickey/password through (no Duo step)
+#   sudo ./install-duo-ssh.sh --failmode secure        # stricter — reject login outright when Duo
+#                                                        cloud is unreachable (risk: Duo outage = lockout)
 #   sudo ./install-duo-ssh.sh --uninstall              # revert to stock SSH config
 #   sudo ./install-duo-ssh.sh --no-menu                # force flag-driven mode even on TTY
 #
@@ -89,6 +93,13 @@ BREAKGLASS_USER=""
 BYPASS_LOCAL=1
 BYPASS_ADDRS=""
 ALLOW_PASSWORD=0
+# pam_duo failmode: how PAM behaves when the Duo cloud is unreachable.
+#   safe   → fall through to first-factor only (publickey/password) — login still works
+#   secure → reject the login outright
+# Default: safe.  Reasoning: a misconfigured failmode is the #1 way users
+# lock themselves out of remote-only hosts when Duo's API has a hiccup.
+# Override per-install with --failmode secure (or via menu).
+FAILMODE="safe"
 SKIP_KEY_CHECK=0
 STRICT_PUBLICKEY=0
 UNINSTALL=0
@@ -125,7 +136,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.3"
+SCRIPT_VERSION="1.7.4"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -219,6 +230,14 @@ while [[ $# -gt 0 ]]; do
         --no-bypass-local) BYPASS_LOCAL=0; shift ;;
         --bypass-addr)    BYPASS_ADDRS="${BYPASS_ADDRS:+$BYPASS_ADDRS,}$2"; shift 2 ;;
         --allow-password) ALLOW_PASSWORD=1; shift ;;
+        --failmode)
+            case "${2:-}" in
+                safe|secure) FAILMODE="$2" ;;
+                "")          echo "--failmode requires safe|secure" >&2; usage 1 ;;
+                *)           echo "Invalid --failmode value: '$2' (must be safe or secure)" >&2; usage 1 ;;
+            esac
+            shift 2
+            ;;
         --skip-key-check) SKIP_KEY_CHECK=1; shift ;;
         --strict-publickey) STRICT_PUBLICKEY=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
@@ -1059,6 +1078,14 @@ read_existing_config() {
         IKEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*ikey[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
         SKEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*skey[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
         HOST="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*host[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
+        # Failmode: only `safe` and `secure` are valid pam_duo values.  An
+        # unrecognised / missing line falls back to the script default rather
+        # than corrupting the in-memory state.
+        local _fm
+        _fm="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*failmode[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
+        case "$_fm" in
+            safe|secure) FAILMODE="$_fm" ;;
+        esac
     fi
 
     if [[ ! -f "$SSHD_CONFIG" ]]; then return 0; fi
@@ -1150,6 +1177,7 @@ print_config_summary() {
 
   Login policy
     Auth mode:        $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey OR password + Duo' || echo 'publickey + Duo only')
+    Failmode:         $FAILMODE  ($([[ "$FAILMODE" == "secure" ]] && echo 'DENY login if Duo cloud unreachable' || echo 'allow first-factor if Duo cloud unreachable'))
     Localhost bypass: $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
     Extra bypass:     ${BYPASS_ADDRS:-(none)}
     Breakglass user:  ${BREAKGLASS_USER:-(none)}
@@ -1197,7 +1225,8 @@ menu_adjust_settings() {
         echo "  2) Toggle localhost bypass          (currently: $([[ $BYPASS_LOCAL -eq 1 ]] && echo ON || echo OFF))"
         echo "  3) Set/clear extra bypass CIDRs     (currently: ${BYPASS_ADDRS:-none})"
         echo "  4) Set/clear breakglass user        (currently: ${BREAKGLASS_USER:-none})"
-        echo "  5) Apply pending changes (re-run install)"
+        echo "  5) Toggle failmode safe ↔ secure    (currently: $FAILMODE)"
+        echo "  6) Apply pending changes (re-run install)"
         echo "  q) Cancel (no changes applied)"
         echo
         local action=""
@@ -1218,6 +1247,18 @@ menu_adjust_settings() {
                 ok "Breakglass user: ${BREAKGLASS_USER:-(none)}"
                 ;;
             5)
+                if [[ "$FAILMODE" == "safe" ]]; then
+                    warn "  secure mode will REJECT logins when Duo cloud is unreachable."
+                    warn "  Make sure you have console access or a working breakglass user."
+                    if menu_yes_no "  Switch to FAILMODE=secure?" "n"; then
+                        FAILMODE="secure"
+                    fi
+                else
+                    FAILMODE="safe"
+                fi
+                ok "Failmode now: $FAILMODE"
+                ;;
+            6)
                 # Show in-memory state (NOT disk) — this is what we are about to apply.
                 print_config_summary
                 echo
@@ -1300,6 +1341,23 @@ install_wizard() {
         fi
     fi
 
+    # Failmode — Duo cloud unreachable behavior.
+    #   safe   → fall through to publickey/password (login still works without Duo)
+    #   secure → reject the login (locks you out if Duo is having an outage)
+    # Default is `safe` because a Duo-side outage that prevents SSH on a
+    # remote host is the most common cause of self-inflicted lockouts.
+    echo
+    echo "  When the Duo cloud is unreachable from this server, pam_duo can either:"
+    echo "    • safe   — let the login through with first-factor only (default)"
+    echo "    • secure — reject the login outright"
+    echo "  'safe' is recommended for remote-only hosts to avoid lockout during"
+    echo "  Duo outages.  Pick 'secure' if you can console in and need stricter MFA."
+    if menu_yes_no "Use STRICT failmode (deny logins when Duo is unreachable)?" "n"; then
+        FAILMODE="secure"
+    else
+        FAILMODE="safe"
+    fi
+
     # ── Step 3/5 — localhost bypass ────────────────────────────────────
     echo
     log "Step 3/5 — Localhost Bypass"
@@ -1339,6 +1397,7 @@ install_wizard() {
   ikey:                 ${IKEY:0:8}…
   host:                 $HOST
   Password fallback:    $([[ $ALLOW_PASSWORD -eq 1 ]] && echo "yes (publickey OR password+Duo)" || echo "no  (publickey+Duo only)")
+  Failmode (Duo down):  $([[ "$FAILMODE" == "secure" ]] && echo "secure (DENY when Duo unreachable)" || echo "safe   (allow first-factor when Duo unreachable)")
   Localhost bypass:     $([[ $BYPASS_LOCAL -eq 1 ]] && echo "yes (127.0.0.0/8, ::1)" || echo "no")
   Extra bypass CIDRs:   ${BYPASS_ADDRS:-(none)}
   Breakglass user:      ${BREAKGLASS_USER:-(none)}
@@ -2536,6 +2595,7 @@ if [[ $ACTION_REINSTALL -eq 1 ]]; then
     saved_bypass_local="$BYPASS_LOCAL"
     saved_bypass_addrs="$BYPASS_ADDRS"
     saved_breakglass="$BREAKGLASS_USER"
+    saved_failmode="$FAILMODE"
 
     log "Phase 1/2: uninstalling..."
     # do_uninstall ends with exit 0; subshell isolates that so we can continue.
@@ -2553,6 +2613,9 @@ if [[ $ACTION_REINSTALL -eq 1 ]]; then
     [[ $saved_bypass_local -eq 0 ]]     && reinstall_args+=(--no-bypass-local)
     [[ -n "$saved_bypass_addrs" ]]      && reinstall_args+=(--bypass-addr "$saved_bypass_addrs")
     [[ -n "$saved_breakglass" ]]        && reinstall_args+=(--breakglass "$saved_breakglass")
+    # Pass failmode through if it was anything other than the default — keeps
+    # the reinstall faithful to whatever was on disk before we tore it down.
+    [[ "$saved_failmode" != "safe" ]]   && reinstall_args+=(--failmode "$saved_failmode")
 
     exec "$SCRIPT_PATH" "${reinstall_args[@]}"
 fi
@@ -2631,13 +2694,13 @@ cat > "$PAM_DUO_CONF" <<EOF
 ikey = $IKEY
 skey = $SKEY
 host = $HOST
-failmode = safe
+failmode = $FAILMODE
 pushinfo = yes
 autopush = no
 EOF
 chmod 600 "$PAM_DUO_CONF"
 chown root:root "$PAM_DUO_CONF"
-ok "Credentials written"
+ok "Credentials written (failmode=$FAILMODE)"
 
 ### 5. Patch /etc/pam.d/sshd
 log "Patching $PAM_SSHD"
