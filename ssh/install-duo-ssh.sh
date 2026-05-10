@@ -125,7 +125,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.2"
+SCRIPT_VERSION="1.7.3"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1574,11 +1574,28 @@ detect_os() {
 }
 
 ### ─── Backup / rollback ─────────────────────────────────────────────────
+# Files outside the three "well-known" paths (sshd_config, pam.d/sshd,
+# pam_duo.conf) that the run modified — most commonly *.conf snippets in
+# /etc/ssh/sshd_config.d/ that we had to rewrite to lift a conflicting
+# `KbdInteractiveAuthentication no` (see fix_sshd_config_d_overrides).
+# Tracked with full path so rollback knows where to put them back.
+TOUCHED_FILES=()
+
 backup_file() {
     local src="$1"
     [[ -f "$src" ]] || return 0
     mkdir -p "$BACKUP_DIR"
     cp -a "$src" "$BACKUP_DIR/$(basename "$src")"
+}
+
+# Backup + record full path so rollback can restore even when the file
+# is not one of the three well-known paths.  Use this for anything we
+# modify outside SSHD_CONFIG / PAM_SSHD / PAM_DUO_CONF.
+backup_and_track() {
+    local src="$1"
+    [[ -f "$src" ]] || return 0
+    backup_file "$src"
+    TOUCHED_FILES+=("$src")
 }
 
 rollback() {
@@ -1587,6 +1604,15 @@ rollback() {
     [[ -f "$BACKUP_DIR/sshd_config" ]]  && cp -a "$BACKUP_DIR/sshd_config"  "$SSHD_CONFIG"
     [[ -f "$BACKUP_DIR/sshd" ]]         && cp -a "$BACKUP_DIR/sshd"         "$PAM_SSHD"
     [[ -f "$BACKUP_DIR/pam_duo.conf" ]] && cp -a "$BACKUP_DIR/pam_duo.conf" "$PAM_DUO_CONF"
+    # Restore any extra files we touched (e.g. sshd_config.d/*.conf snippets
+    # whose `KbdInteractiveAuthentication no` we had to disable).  Indirect
+    # expansion guarded with :- so an empty array under set -u doesn't bomb.
+    local f base
+    for f in "${TOUCHED_FILES[@]:-}"; do
+        [[ -n "$f" ]] || continue
+        base="$(basename "$f")"
+        [[ -f "$BACKUP_DIR/$base" ]] && cp -a "$BACKUP_DIR/$base" "$f"
+    done
     restart_sshd
     warn "Rolled back. Original config restored."
 }
@@ -2020,6 +2046,23 @@ for line in lines:
 p.write_text("".join(out))
 PYEOF
 
+    # Restore any sshd_config.d/*.conf snippets we disabled during install.
+    # Lines were prefixed with "# kh-duo-disabled: " by fix_sshd_config_d_overrides;
+    # strip that sentinel to put the original directive back in force.
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        shopt -s nullglob
+        local f
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -f "$f" ]] || continue
+            if grep -qE '^# kh-duo-disabled: ' "$f"; then
+                backup_file "$f"
+                sed -i -E 's|^# kh-duo-disabled: ||' "$f"
+                ok "Restored disabled directives in $f"
+            fi
+        done
+        shopt -u nullglob
+    fi
+
     # Remove packages and repos
     if [[ "$OS_FAMILY" == "debian" ]]; then
         dpkg -l duo-unix    2>/dev/null | grep -q '^ii' && apt_get remove -y duo-unix              >/dev/null 2>&1 || true
@@ -2035,6 +2078,69 @@ PYEOF
     restart_sshd
     ok "Uninstalled. Duo no longer enforced on SSH."
     exit 0
+}
+
+### ─── Lift conflicting overrides from /etc/ssh/sshd_config.d/ ────────────
+# sshd parses Include'd files inline at the position of the Include
+# directive in /etc/ssh/sshd_config (which Debian/Ubuntu place near the
+# top), and "first occurrence wins" for most directives.  So a snippet
+# like /etc/ssh/sshd_config.d/disable-password.conf containing
+#
+#   PasswordAuthentication no
+#   KbdInteractiveAuthentication no
+#   ChallengeResponseAuthentication no
+#
+# pins KbdInteractiveAuthentication to `no` BEFORE patch_sshd_config()
+# ever gets to rewrite the line in the main file — and Duo's PAM stack
+# rides on `keyboard-interactive`, so sshd -t then refuses with:
+#
+#   Disabled method "keyboard-interactive" in AuthenticationMethods list
+#
+# We comment those lines out (with a sentinel prefix so uninstall can
+# restore them) and leave anything else in the snippet alone.
+# PasswordAuthentication only conflicts when --allow-password is on; in
+# default publickey+Duo mode we want it `no` and leave it alone.
+fix_sshd_config_d_overrides() {
+    local d="/etc/ssh/sshd_config.d"
+    [[ -d "$d" ]] || return 0
+
+    # Directives whose `no` value would block our `keyboard-interactive:pam`
+    # alternative.  ChallengeResponseAuthentication is the legacy alias of
+    # KbdInteractiveAuthentication and shares the same effective slot.
+    local conflicts=(
+        'KbdInteractiveAuthentication'
+        'ChallengeResponseAuthentication'
+    )
+    if [[ $ALLOW_PASSWORD -eq 1 ]]; then
+        conflicts+=('PasswordAuthentication')
+    fi
+
+    shopt -s nullglob
+    local f directive line announced=0
+    for f in "$d"/*.conf; do
+        [[ -f "$f" ]] || continue
+
+        local touched=0
+        for directive in "${conflicts[@]}"; do
+            # Match: optional leading whitespace, directive name, whitespace, `no`, end-of-token
+            if grep -qE "^[[:space:]]*${directive}[[:space:]]+no\b" "$f"; then
+                if [[ $announced -eq 0 ]]; then
+                    log "Checking $d/*.conf for directives that block Duo"
+                    announced=1
+                fi
+                if [[ $touched -eq 0 ]]; then
+                    backup_and_track "$f"
+                    touched=1
+                fi
+                # Comment with a recoverable sentinel so do_uninstall can flip it back.
+                sed -i -E "s|^([[:space:]]*${directive}[[:space:]]+no\b.*)$|# kh-duo-disabled: \1|" "$f"
+                line="$(grep -nE "^# kh-duo-disabled: [[:space:]]*${directive}\b" "$f" | head -1)"
+                ok "Disabled '${directive} no' in $f${line:+  (${line%%:*})}"
+            fi
+        done
+    done
+    shopt -u nullglob
+    return 0
 }
 
 ### ─── Patch sshd_config ─────────────────────────────────────────────────
@@ -2538,6 +2644,10 @@ log "Patching $PAM_SSHD"
 patch_pam "$PAM_DUO_SO" "$ALLOW_PASSWORD" "$OS_FAMILY"
 
 ### 6. Patch /etc/ssh/sshd_config
+# Pre-flight: lift any `KbdInteractiveAuthentication no` / `ChallengeResponseAuthentication no`
+# in /etc/ssh/sshd_config.d/*.conf, since "first occurrence wins" and those
+# Include'd snippets parse before our edits to the main file.
+fix_sshd_config_d_overrides
 patch_sshd_config
 
 ### 7. SELinux check (RHEL only)
