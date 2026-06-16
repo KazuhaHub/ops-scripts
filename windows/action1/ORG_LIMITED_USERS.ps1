@@ -1,26 +1,22 @@
-﻿[CmdletBinding()]
-param(
-    [switch]$Apply,         # apply policies (skip menu)
-    [switch]$Uninstall,     # run CLEAN_ALL
-    [switch]$CheckUpdate,   # check upstream version (no admin required)
-    [switch]$SelfUpdate,    # download latest, replace, and (in -Unattended) auto-apply
-    [switch]$Version,       # print version and exit (no admin required)
-    [switch]$Unattended,    # no menu, no Read-Host prompts (used by SYSTEM scheduled task)
-    [switch]$NoMenu,        # alias for -Unattended
-    [switch]$Help
-)
-
-if ($NoMenu) { $Unattended = $true }
+﻿# ============================================================
+# ORG_LIMITED_USERS.ps1 (Action1 build) — Kazuha Hub policy for LIMITED /
+# personal restricted-user devices (staff laptops without local admin): 120m
+# idle logoff, looser power timeouts, logoff-on-resume, user profiles kept.
+#
+# Built for Action1 batch push: runs as LocalSystem, non-interactive, no menu,
+# no GitHub self-update. Push with NO arguments to apply.
+#
+# No param()/[CmdletBinding()] on purpose: Action1 prepends preference statements
+# ahead of the script, which makes a top-level param() block a parse error
+# ("Unexpected attribute 'CmdletBinding'" / "Unexpected token 'param'").
+# ============================================================
+$ErrorActionPreference = 'Continue'   # best-effort; overrides Action1's preamble
 
 # ============================================================
 # Constants
 # ============================================================
 $ScriptVersion       = "1.6.0"
 $ScriptName          = "ORG_LIMITED_USERS"
-$AutoUpdateTaskName  = "Kazuha Hub Auto Update"
-$TrustedUrlPrefix    = "https://raw.githubusercontent.com/"
-$DefaultRawUrl       = "https://raw.githubusercontent.com/KazuhaHub/ops-scripts/master/windows/$ScriptName.ps1"
-$ScriptRawUrl        = if ($env:KH_WIN_UPDATE_URL) { $env:KH_WIN_UPDATE_URL } else { $DefaultRawUrl }
 
 # Idle logoff threshold (minutes) — LIMITED is more permissive than PUBLIC
 $IdleLogoffMinutes   = 120
@@ -64,225 +60,6 @@ function Assert-IsAdmin {
     if (-not (Test-IsAdmin)) {
         Die "This action requires Administrator privileges. Re-run from an elevated PowerShell session."
     }
-}
-
-function Assert-TrustedUrl {
-    if ($ScriptRawUrl -notlike "$TrustedUrlPrefix*") {
-        Die "Refusing untrusted update URL '$ScriptRawUrl' — must start with $TrustedUrlPrefix"
-    }
-}
-
-# Refuse privileged self-update / auto-task registration when the script lives in
-# a directory the caller doesn't trust (e.g. /Users/<user>/Downloads/). Otherwise
-# a user could swap the file under SYSTEM between scheduled-task firings.
-function Assert-ScriptOwnedByPrivilegedPrincipal {
-    if (-not $PSCommandPath -or -not (Test-Path $PSCommandPath)) { return }
-    try {
-        $owner = (Get-Acl -Path $PSCommandPath).Owner
-    } catch {
-        Write-LogWarn "Could not determine owner of $PSCommandPath — proceeding"
-        return
-    }
-    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
-    if ($owner -notin $trusted) {
-        Die "Refusing privileged operation: $PSCommandPath is owned by '$owner', not a privileged principal. Move it to a system-owned location (e.g. C:\ProgramData\KazuhaHub\) and re-run."
-    }
-}
-
-# ============================================================
-# Version handling / self-update
-# ============================================================
-function Get-RemoteVersion {
-    try {
-        $content = Invoke-RestMethod -Uri $ScriptRawUrl -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
-    } catch {
-        return $null
-    }
-    $m = [regex]::Match($content, '^\$ScriptVersion\s*=\s*"([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::Multiline)
-    if ($m.Success) { return $m.Groups[1].Value }
-    return $null
-}
-
-function Test-VersionNewer {
-    param([string]$Remote, [string]$Local)
-    try { return ([version]$Remote -gt [version]$Local) } catch { return $false }
-}
-
-function Invoke-CheckUpdate {
-    Assert-TrustedUrl
-    Write-LogInfo "Local version: $ScriptVersion"
-    Write-LogInfo "Checking $ScriptRawUrl ..."
-    $remote = Get-RemoteVersion
-    if (-not $remote) {
-        Write-LogWarn "Could not fetch remote version (offline or upstream unreachable)"
-        return $false
-    }
-    if ($remote -eq $ScriptVersion) {
-        Write-LogOk "You are on the latest version ($ScriptVersion)"
-        return $false
-    }
-    if (-not (Test-VersionNewer $remote $ScriptVersion)) {
-        Write-LogOk "Local $ScriptVersion is ahead of upstream $remote (development build)"
-        return $false
-    }
-    Write-LogWarn "Update available: $ScriptVersion -> $remote (run with -SelfUpdate to apply)"
-    return $true
-}
-
-function Invoke-SelfUpdate {
-    param([switch]$AutoApply)
-
-    Assert-IsAdmin
-    Assert-TrustedUrl
-    Assert-ScriptOwnedByPrivilegedPrincipal
-
-    if (-not $PSCommandPath) {
-        Die "Cannot self-update: \$PSCommandPath is empty (script not invoked from a file)."
-    }
-
-    Write-LogInfo "Downloading $ScriptRawUrl ..."
-
-    $tmp = New-TemporaryFile
-    try {
-        Invoke-WebRequest -Uri $ScriptRawUrl -OutFile $tmp.FullName -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Remove-Item $tmp.FullName -Force -ErrorAction SilentlyContinue
-        Die "Download failed: $($_.Exception.Message)"
-    }
-
-    $content = Get-Content -Raw $tmp.FullName
-    if (-not $content) { Remove-Item $tmp.FullName -Force; Die "Downloaded file is empty" }
-
-    if ($content -notmatch '(?m)^\s*(\[CmdletBinding|param\s*\(|#)') {
-        Remove-Item $tmp.FullName -Force
-        Die "Downloaded file does not look like a PowerShell script — refusing to install"
-    }
-
-    $tokens = $errors = $null
-    [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$tokens, [ref]$errors) | Out-Null
-    if ($errors -and $errors.Count -gt 0) {
-        Remove-Item $tmp.FullName -Force
-        Die "Downloaded file failed PowerShell parse — refusing to install ($($errors[0].Message))"
-    }
-
-    $newVersion = "(unknown)"
-    $vm = [regex]::Match($content, '^\$ScriptVersion\s*=\s*"([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::Multiline)
-    if ($vm.Success) { $newVersion = $vm.Groups[1].Value }
-
-    $ts     = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backup = "$PSCommandPath.bak.$ts"
-    Copy-Item -Path $PSCommandPath -Destination $backup -Force
-    Move-Item -Path $tmp.FullName  -Destination $PSCommandPath -Force
-
-    Write-LogOk "Self-update complete: $ScriptVersion -> $newVersion (backup: $backup)"
-
-    if ($AutoApply) {
-        Write-LogInfo "Auto-applying new version (unattended)..."
-        $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Apply', '-Unattended')
-        $proc = Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -NoNewWindow
-        Write-LogOk "Apply finished with exit code $($proc.ExitCode)"
-        exit $proc.ExitCode
-    }
-}
-
-# ============================================================
-# Daily auto-update scheduled task
-# ============================================================
-function Register-AutoUpdateTask {
-    Assert-IsAdmin
-    Assert-ScriptOwnedByPrivilegedPrincipal
-
-    if (-not $PSCommandPath) {
-        Write-LogWarn "Cannot register auto-update task: \$PSCommandPath is empty"
-        return
-    }
-
-    try { Unregister-ScheduledTask -TaskName $AutoUpdateTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-
-    $action = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Unattended -SelfUpdate"
-
-    $trigger = New-ScheduledTaskTrigger -Daily -At "04:00"
-
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
-        -LogonType ServiceAccount `
-        -RunLevel Highest
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
-
-    Register-ScheduledTask `
-        -TaskName $AutoUpdateTaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $settings `
-        -Force | Out-Null
-
-    Write-LogOk "Auto-update task '$AutoUpdateTaskName' registered (daily 04:00 as SYSTEM, points to $PSCommandPath)"
-}
-
-# ============================================================
-# Uninstall (delegate to CLEAN_ALL.ps1)
-# ============================================================
-function Invoke-Uninstall {
-    Assert-IsAdmin
-
-    $scriptDir = Split-Path $PSCommandPath -Parent
-    $cleanAll  = Join-Path $scriptDir "CLEAN_ALL.ps1"
-
-    if (Test-Path $cleanAll) {
-        Write-LogInfo "Running $cleanAll ..."
-        & $cleanAll -Apply -Unattended:$Unattended
-        return
-    }
-
-    $cleanUrl = $ScriptRawUrl -replace '[^/]+\.ps1$', 'CLEAN_ALL.ps1'
-    if ($cleanUrl -notlike "$TrustedUrlPrefix*") { Die "Could not derive trusted CLEAN_ALL URL" }
-
-    Write-LogInfo "CLEAN_ALL.ps1 not found locally, downloading from $cleanUrl ..."
-    $tmp = New-TemporaryFile
-    try {
-        Invoke-WebRequest -Uri $cleanUrl -OutFile $tmp.FullName -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Remove-Item $tmp.FullName -Force -ErrorAction SilentlyContinue
-        Die "Download failed: $($_.Exception.Message)"
-    }
-
-    $content = Get-Content -Raw $tmp.FullName
-    $tokens = $errors = $null
-    [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$tokens, [ref]$errors) | Out-Null
-    if ($errors) { Remove-Item $tmp.FullName -Force; Die "Downloaded CLEAN_ALL failed parse" }
-
-    & $tmp.FullName -Apply -Unattended:$Unattended
-    Remove-Item $tmp.FullName -Force
-}
-
-# ============================================================
-# Interactive menu
-# ============================================================
-function Show-Menu {
-    Write-Host ""
-    Write-Host "  +-----------------------------------------------------------------------+" -ForegroundColor Cyan
-    Write-Host ("  | Kazuha Hub Windows Policy   {0,-41} |" -f "$ScriptName v$ScriptVersion") -ForegroundColor Cyan
-    Write-Host "  +-----------------------------------------------------------------------+" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "What would you like to do?"
-    Write-Host "  1) Apply this profile  (default)"
-    Write-Host "  2) Uninstall (revert all Kazuha Hub policies via CLEAN_ALL)"
-    Write-Host "  3) Check for script updates"
-    Write-Host "  4) Self-update now (download latest and re-apply)"
-    Write-Host "  5) Quit"
-    Write-Host ""
-
-    $choice = Read-Host "Choice [1]"
-    if (-not $choice) { $choice = "1" }
-    return $choice
 }
 
 # ============================================================
@@ -370,7 +147,7 @@ function Invoke-ApplyPolicies {
     # Default User hive (HKU\.DEFAULT)
     # ===========================
     & reg.exe add "HKU\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableLockWorkstation /t REG_DWORD /d 1 /f | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Error "reg add HKU\.DEFAULT\...\DisableLockWorkstation failed (exit $LASTEXITCODE)." }  # surface a failed native write (otherwise silently ignored)
+    if ($LASTEXITCODE -ne 0) { Write-Error "reg add HKU\.DEFAULT\...\DisableLockWorkstation failed (exit $LASTEXITCODE)." }  # native exit is invisible to the #5 scan otherwise
 
     # ===========================
     # Legal Notice before Ctrl+Alt+Delete
@@ -399,7 +176,8 @@ $ScriptName-v$ScriptVersion
     # Lock screen + desktop wallpaper (PersonalizationCSP). Enterprise/Education
     # only (Pro needs SharedPC; ignored on Home) and LOCKS the images so users
     # cannot change them. Download is best-effort: a CDN/network failure warns and
-    # skips enforcement (never enforces a missing/partial path) without aborting.
+    # skips enforcement (never enforces a missing path) without failing the run; a
+    # registry write failure DOES fail it (caught by the #5 scan).
     # ===========================
     function Test-IsImage {
         param([string]$Path)
@@ -587,9 +365,9 @@ try {
         /F `
         /RU "SYSTEM" | Out-Null
 
-    # schtasks is native: a nonzero exit is otherwise silently ignored. This task is
-    # the profile's core feature (idle logoff), so surface a failure via Write-Error
-    # (visible in console / Event Log) instead of logging a false success.
+    # schtasks is native: a nonzero exit is invisible to the #5 $Error scan (empty
+    # CategoryInfo.Activity). This task IS the profile's core feature, so surface a
+    # failure via Write-Error so #5 fails the Action1 run instead of false-success.
     if ($LASTEXITCODE -ne 0) {
         Write-Error "schtasks /Create failed for '$IdleTaskName' (exit $LASTEXITCODE) -- idle logoff NOT installed."
     } else {
@@ -755,75 +533,57 @@ try {
     }
 
     # ===========================
-    # Daily auto-update task
-    # ===========================
-    Register-AutoUpdateTask
-
-    # ===========================
-    # Apply Group Policy + restart prompt
+    # Apply Group Policy
     # ===========================
     Write-LogInfo "Forcing Group Policy update to apply all settings immediately..."
     gpupdate /force | Out-Null
 
     Write-Host ""
-    Write-LogOk "All Kazuha Hub Windows PC Policies configured. Please RESTART the computer to fully apply all settings."
+    Write-LogOk "All Kazuha Hub Windows PC Policies configured."
     Write-Host ""
-
-    if ($Unattended) {
-        Write-LogInfo "Unattended mode: skipping restart prompt."
-        return
-    }
-
-    $resp = Read-Host "Do you want to RESTART now? (Y/N)"
-    if ($resp -in @('Y','y')) {
-        Restart-Computer -Force
-    }
 }
 
 # ============================================================
-# Main dispatch
+# Action1 entry point
+#
+# Action1 pushes this with NO arguments and runs it as LocalSystem in a
+# non-interactive session — so there is no menu, no GitHub self-update, and no
+# daily auto-update task (Action1 owns deployment and versioning). It just
+# applies the profile and reports the result through the exit code:
+#   exit 0 = success
+#   exit 1 = failure (Action1 marks the run as Error)
 # ============================================================
-if ($Help) {
-    Get-Help $PSCommandPath -Detailed
-    exit 0
-}
-
-if ($Version) {
-    "$ScriptName $ScriptVersion"
-    exit 0
-}
-
-# -CheckUpdate is read-only and does not require admin
-if ($CheckUpdate -and -not $SelfUpdate) {
-    Invoke-CheckUpdate | Out-Null
-    exit 0
-}
-
-if ($SelfUpdate) {
-    # Auto-apply when running unattended (e.g. from the daily task)
-    Invoke-SelfUpdate -AutoApply:$Unattended
-    exit 0
-}
-
-if ($Uninstall) {
-    Invoke-Uninstall
-    exit 0
-}
-
-if ($Apply -or $Unattended) {
+$Error.Clear()
+try {
     Invoke-ApplyPolicies
-    exit 0
+} catch {
+    Write-LogErr "Policy apply aborted (terminating error): $($_.Exception.Message)"
+    exit 1
 }
 
-# No flags + interactive -> menu loop
-while ($true) {
-    $choice = Show-Menu
-    switch ($choice) {
-        '1' { Invoke-ApplyPolicies; exit 0 }
-        '2' { Invoke-Uninstall;     exit 0 }
-        '3' { Invoke-CheckUpdate | Out-Null }
-        '4' { Invoke-SelfUpdate -AutoApply; exit 0 }
-        '5' { Write-LogOk "No changes made."; exit 0 }
-        default { Write-LogWarn "Invalid choice '$choice'" }
+# Best-effort writes are non-terminating, so they wouldn't fail the job on their
+# own. Inspect the error stream for REAL failures and fail the Action1 run if any
+# occurred — excluding expected no-ops (reads, value clears, absent LAPS/tasks).
+$benignActivities = @(
+    'Remove-ItemProperty','Remove-Item','Unregister-ScheduledTask','Get-ScheduledTask',
+    'Get-Command','Get-Content','Get-Item','Get-ItemProperty','Invoke-LapsPolicyProcessing','Invoke-WebRequest'
+)
+$realFailures = @($Error | Where-Object {
+    $_ -is [System.Management.Automation.ErrorRecord] -and
+    $_.CategoryInfo.Activity -and
+    ($benignActivities -notcontains $_.CategoryInfo.Activity)
+})
+if ($realFailures.Count -gt 0) {
+    Write-LogErr "$($realFailures.Count) error(s) during apply — reporting failure to Action1:"
+    $realFailures | Select-Object -First 25 | ForEach-Object {
+        Write-LogErr "  - [$($_.CategoryInfo.Activity)] $($_.Exception.Message)"
     }
+    exit 1
 }
+
+# This endpoint is managed by Action1 now — remove any legacy GitHub self-update
+# task left by the iex / Install.ps1 deployment so the two don't fight.
+try { Unregister-ScheduledTask -TaskName "Kazuha Hub Auto Update" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+Write-LogOk "Done — no reboot required (settings apply at next sign-in / gpupdate)."
+exit 0

@@ -178,6 +178,14 @@ UX 流程：合上笔记本 → 系统进入 sleep → 掀开 → 唤醒 → 触
 
 > ⚠️ 部分使用 Modern Standby (S0) 的设备可能不会触发 `Power-Troubleshooter` Event 1。如遇问题可临时把 LIDACTION 改成 `3`（关机）作为备选方案。
 
+### 锁屏图 / 桌面壁纸（PersonalizationCSP，v1.6.0 起）
+
+通过 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP` 强制并**锁定**锁屏图（`LockScreenImage{Status,Path,Url}`）和桌面壁纸（`DesktopImage{Status,Path,Url}`），用户改不了。`CLEAN_ALL` 撤销。
+
+- **仅 Enterprise/Education 生效**（Pro 需 SharedPC，Home 忽略）。
+- 图片来源是脚本顶部常量 `$LockScreenImageUrl` / `$DesktopImageUrl`，下载到 `$LockScreenImagePath` / `$DesktopImagePath`（默认 `C:\ProgramData\KazuhaHub\`，**文件名不能有空格**，否则 CSP 报 Status=2）。预置好图片就把对应 URL 设成 `''`。
+- 下载 **best-effort**：失败只告警、删掉残留半截文件、跳过强制（绝不锁定一张缺失/损坏的图），不中断策略应用；强制了 TLS 1.2。图片已存在且非空就不重复下载。
+
 ---
 
 ## ORG_PUBLIC_ALL.ps1
@@ -192,7 +200,7 @@ UX 流程：合上笔记本 → 系统进入 sleep → 掀开 → 唤醒 → 触
 | 进入睡眠（AC + DC） | `60` 分钟 |
 | 计划任务名 | `Idle 20m Logoff` |
 
-空闲注销实现：写 helper 到 `C:\ProgramData\KazuhaHub\IdleLogoffAll.ps1`，按 `quser` **表头列位置** 解析每个 session 的 ID/State/Idle Time（不是按空格 split），然后通过 `schtasks /Create /SC MINUTE /MO 1 /RU SYSTEM` 每分钟检查一次，超过阈值即调用 `logoff.exe <sessionId>`。
+空闲注销实现（v1.6.0 起）：写 helper 到 `C:\ProgramData\KazuhaHub\IdleLogoffAll.ps1`，通过 **WTS API**（`wtsapi32.dll`，`Add-Type` P/Invoke）枚举会话并按 `WTSINFO.LastInputTime` 算空闲时间 —— **语言/SKU 无关**（替代旧的 `quser`/`logoff.exe` 文本解析，那个在非英文系统上会失效）；失败安全：读不到/算不出可信值就跳过，绝不误踢。然后 `schtasks /Create /SC MINUTE /MO 1 /RU SYSTEM` 每分钟检查一次，超阈值即 `WTSLogoffSession`。`schtasks /Create` 会检查 `$LASTEXITCODE` 并在失败时报错。
 
 电源超时通过策略 + `powercfg /X` 双层锁定。
 

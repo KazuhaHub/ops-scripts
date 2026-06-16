@@ -15,7 +15,7 @@ if ($NoMenu) { $Unattended = $true }
 # ============================================================
 # Constants
 # ============================================================
-$ScriptVersion       = "1.5.0"
+$ScriptVersion       = "1.6.0"
 $ScriptName          = "ORG_PUBLIC_ALL"
 $AutoUpdateTaskName  = "Kazuha Hub Auto Update"
 $TrustedUrlPrefix    = "https://raw.githubusercontent.com/"
@@ -32,6 +32,16 @@ $SleepAfterMinutes   = 60
 
 # Profile cleanup days (set to 0 to skip — PUBLIC enables this, LIMITED does not)
 $ProfileCleanupDays  = 8
+
+# Lock screen + desktop wallpaper, enforced & locked via PersonalizationCSP.
+# Enterprise/Education only (Pro needs SharedPC; ignored on Home). Set a URL to
+# '' to skip the download (pre-stage the file). Paths must contain NO spaces.
+$LockScreenImageUrl    = 'https://cdn.jsdelivr.net/gh/KKazuhaK/picx-images-hosting@master/download.26m4zsywfz.jpeg'
+$LockScreenImagePath   = 'C:\ProgramData\KazuhaHub\lockscreen.jpeg'
+$LockScreenImageSha256 = ''
+$DesktopImageUrl       = 'https://dl.kazuha.org/wallpaper/desktop.jpg'
+$DesktopImagePath      = 'C:\ProgramData\KazuhaHub\desktop.jpg'
+$DesktopImageSha256    = ''
 
 # ============================================================
 # Logging helpers
@@ -285,7 +295,7 @@ function Invoke-ApplyPolicies {
     # LAPS policy (Windows)
     # ===========================
     $path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS"
-    New-Item -Path $path -Force | Out-Null
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
 
     New-ItemProperty -Path $path -Name "BackupDirectory" -PropertyType DWord -Value 1 -Force | Out-Null
     New-ItemProperty -Path $path -Name "PasswordComplexity" -PropertyType DWord -Value 4 -Force | Out-Null
@@ -297,25 +307,35 @@ function Invoke-ApplyPolicies {
 
     try { Invoke-LapsPolicyProcessing } catch { Write-LogWarn "Invoke-LapsPolicyProcessing not available: $($_.Exception.Message)" }
 
+    # --- LAPS backup prerequisites (warn-only; the policy is written regardless) ---
+    if (-not (Get-Command Invoke-LapsPolicyProcessing -ErrorAction SilentlyContinue)) {
+        Write-LogWarn "Windows LAPS not present on this OS (needs Win11/Server2022 or the 2023-04 cumulative update). LAPS policy is written but stays inert until the OS supports it."
+    }
+    $dsreg = ''
+    if (Get-Command dsregcmd.exe -ErrorAction SilentlyContinue) { $dsreg = (& dsregcmd /status 2>$null | Out-String) }
+    if ($dsreg -and ($dsreg -notmatch 'AzureAdJoined\s*:\s*YES')) {
+        Write-LogWarn "Device is not Entra (Azure AD) joined. LAPS BackupDirectory=1 (backup to Entra) will not take effect until it is."
+    }
+
     # ===========================
     # Windows Hello for Business / PIN (disable)
     # ===========================
-    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork")) { New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork" `
         -Name "Enabled" -PropertyType DWord -Value 0 -Force | Out-Null
 
-    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System")) { New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" `
         -Name "AllowDomainPINLogon" -PropertyType DWord -Value 0 -Force | Out-Null
 
-    New-Item -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Settings\AllowSignInOptions" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Settings\AllowSignInOptions")) { New-Item -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Settings\AllowSignInOptions" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Settings\AllowSignInOptions" `
         -Name "value" -PropertyType DWord -Value 0 -Force | Out-Null
 
     # ===========================
     # Lock workstation / Switch User restrictions
     # ===========================
-    New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System")) { New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Force | Out-Null }
 
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
         -Name "DisableLockWorkstation" -PropertyType DWord -Value 1 -Force | Out-Null
@@ -342,7 +362,7 @@ function Invoke-ApplyPolicies {
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
         -Name "DontDisplayLockedUserId" -PropertyType DWord -Value 3 -Force | Out-Null
 
-    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System")) { New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" `
         -Name "EnumerateLocalUsers" -PropertyType DWord -Value 0 -Force | Out-Null
 
@@ -350,6 +370,7 @@ function Invoke-ApplyPolicies {
     # Default User hive (HKU\.DEFAULT)
     # ===========================
     & reg.exe add "HKU\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableLockWorkstation /t REG_DWORD /d 1 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "reg add HKU\.DEFAULT\...\DisableLockWorkstation failed (exit $LASTEXITCODE)." }  # surface a failed native write (otherwise silently ignored)
 
     # ===========================
     # Legal Notice before Ctrl+Alt+Delete
@@ -368,11 +389,83 @@ $ScriptName-v$ScriptVersion
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
         -Name "legalnoticetext" -PropertyType String -Value $LegalNoticeText -Force | Out-Null
 
-    New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon")) { New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
         -Name "LegalNoticeCaption" -PropertyType String -Value $LegalNoticeTitle -Force | Out-Null
     New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
         -Name "LegalNoticeText" -PropertyType String -Value $LegalNoticeText -Force | Out-Null
+
+    # ===========================
+    # Lock screen + desktop wallpaper (PersonalizationCSP). Enterprise/Education
+    # only (Pro needs SharedPC; ignored on Home) and LOCKS the images so users
+    # cannot change them. Download is best-effort: a CDN/network failure warns and
+    # skips enforcement (never enforces a missing/partial path) without aborting.
+    # ===========================
+    function Test-IsImage {
+        param([string]$Path)
+        if (-not (Test-Path $Path)) { return $false }
+        $b = $null
+        try { $b = Get-Content -LiteralPath $Path -Encoding Byte -TotalCount 4 -ErrorAction Stop } catch { return $false }
+        if (-not $b -or $b.Count -lt 4) { return $false }
+        if ($b[0] -eq 255 -and $b[1] -eq 216 -and $b[2] -eq 255) { return $true }                  # JPEG  FF D8 FF
+        if ($b[0] -eq 137 -and $b[1] -eq 80 -and $b[2] -eq 78 -and $b[3] -eq 71) { return $true }   # PNG   89 50 4E 47
+        return $false
+    }
+    function Set-PersonalizationImage {
+        param([string]$Prefix, [string]$Url, [string]$Path, [string]$Sha256)
+        if (-not $Path) { return }
+        $imgDir = Split-Path $Path -Parent
+        if (-not (Test-Path $imgDir)) { New-Item -Path $imgDir -ItemType Directory -Force | Out-Null }
+
+        # Fetch if the on-disk file is missing or not a real image -- this catches a
+        # 0-byte/partial download AND an HTTP-200 "soft error" HTML body (a CDN can
+        # return 200 + an error page) -- or when pinned-by-checksum and stale.
+        $need = $false
+        if ($Url) {
+            if (-not (Test-IsImage $Path)) {
+                $need = $true
+            } elseif ($Sha256) {
+                $cur = ''
+                try { $cur = (Get-FileHash -Path $Path -Algorithm SHA256).Hash } catch {}
+                if ($cur -ne $Sha256.ToUpper()) { $need = $true }
+            }
+        }
+        if ($need) {
+            try {
+                try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+                Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            } catch {
+                Write-LogWarn "$Prefix image download failed: $($_.Exception.Message) (best-effort; not enforcing)"
+            }
+            # Whatever landed, if it is not a real image (download error, partial, or a
+            # 200 HTML error page) delete it so it is never enforced and never sticky
+            # (the next run re-downloads); only log success for a valid image.
+            if ((Test-Path $Path) -and -not (Test-IsImage $Path)) {
+                Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+            } elseif (Test-IsImage $Path) {
+                Write-LogOk "Downloaded $Prefix image -> $Path"
+            }
+        }
+
+        # Enforce only a real image file (optionally checksum-pinned).
+        $ok = Test-IsImage $Path
+        if ($ok -and $Sha256) {
+            $h = ''
+            try { $h = (Get-FileHash -Path $Path -Algorithm SHA256).Hash } catch {}
+            if ($h -ne $Sha256.ToUpper()) { Write-LogWarn "$Prefix image checksum mismatch ($h); not enforcing."; $ok = $false }
+        }
+        if (-not $ok) { Write-LogWarn "$Prefix image unavailable/invalid; PersonalizationCSP ${Prefix}Image* NOT set."; return }
+
+        $cspKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+        if (-not (Test-Path $cspKey)) { New-Item -Path $cspKey -Force | Out-Null }
+        New-ItemProperty -Path $cspKey -Name "${Prefix}ImageStatus" -PropertyType DWord  -Value 1     -Force | Out-Null
+        New-ItemProperty -Path $cspKey -Name "${Prefix}ImagePath"   -PropertyType String -Value $Path -Force | Out-Null
+        New-ItemProperty -Path $cspKey -Name "${Prefix}ImageUrl"    -PropertyType String -Value $Path -Force | Out-Null
+        Write-LogOk "$Prefix image enforced & locked via PersonalizationCSP (Enterprise/Education; ignored on Home/Pro)."
+    }
+
+    Set-PersonalizationImage -Prefix 'LockScreen' -Url $LockScreenImageUrl -Path $LockScreenImagePath -Sha256 $LockScreenImageSha256
+    Set-PersonalizationImage -Prefix 'Desktop'    -Url $DesktopImageUrl    -Path $DesktopImagePath    -Sha256 $DesktopImageSha256
 
     # ===========================
     # Profile cleanup after N days (PUBLIC only)
@@ -397,52 +490,86 @@ $ScriptName-v$ScriptVersion
     @'
 param([int]$Minutes = 20)
 
+# Locale- and SKU-independent idle logoff via the WTS API (wtsapi32.dll, present
+# on every Windows SKU). Replaces the old quser/logoff.exe text parsing, which
+# broke on non-English Windows (localized column headers) and editions without
+# quser.exe. Fails SAFE: if a session's input/clock times cannot be read or look
+# implausible, the session is SKIPPED -- never force-logged-off on a guess.
+# Scope: ANY session past the idle threshold is logged off, including disconnected
+# RDP sessions (idle counts from disconnect) -- intentional for shared/kiosk use.
+
 $ErrorActionPreference = 'Continue'
 
-$output = @(quser 2>$null)
-if ($output.Count -lt 2) { return }
-
-$header   = $output[0]
-$idCol    = $header.IndexOf('ID')
-$stateCol = $header.IndexOf('STATE')
-$idleCol  = $header.IndexOf('IDLE TIME')
-$logonCol = $header.IndexOf('LOGON TIME')
-
-if ($idCol -lt 0 -or $stateCol -lt 0 -or $idleCol -lt 0 -or $logonCol -lt 0) { return }
-
-$idLen    = $stateCol - $idCol
-$stateLen = $idleCol  - $stateCol
-$idleLen  = $logonCol - $idleCol
-
-function Get-IdleMinutes {
-    param([string]$idle)
-    if ($null -eq $idle) { return 0 }
-    $idle = $idle.Trim()
-    if (-not $idle -or $idle -eq '.' -or $idle -eq 'none' -or $idle -eq '-') { return 0 }
-    if ($idle -match '^(\d+)\+(\d{1,2}):(\d{2})$') { return [int]$matches[1]*1440 + [int]$matches[2]*60 + [int]$matches[3] }
-    if ($idle -match '^(\d{1,2}):(\d{2})$') { return [int]$matches[1]*60 + [int]$matches[2] }
-    if ($idle -match '^\d+$') { return [int]$idle }
-    return 0
+try {
+    if (-not ('KhWts' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class KhWts {
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern int WTSEnumerateSessions(IntPtr hServer, int Reserved, int Version, out IntPtr ppSessionInfo, out int pCount);
+    [DllImport("wtsapi32.dll")]
+    public static extern void WTSFreeMemory(IntPtr pMemory);
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern bool WTSQuerySessionInformation(IntPtr hServer, int SessionId, int WTSInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern bool WTSLogoffSession(IntPtr hServer, int SessionId, bool bWait);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SESSION_INFO { public int SessionId; public IntPtr pName; public int State; }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    public struct WTSINFO {
+        public int State; public int SessionId;
+        public int IncomingBytes; public int OutgoingBytes;
+        public int IncomingFrames; public int OutgoingFrames;
+        public int IncomingCompressedBytes; public int OutgoingCompressedBytes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string WinStationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=17)] public string Domain;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=21)] public string UserName;
+        public long ConnectTime; public long DisconnectTime;
+        public long LastInputTime; public long LogonTime; public long CurrentTime;
+    }
 }
-
-for ($i = 1; $i -lt $output.Count; $i++) {
-    $line = $output[$i]
-    if (-not $line -or -not $line.Trim()) { continue }
-    if ($line.Length -lt ($idleCol + 1)) { continue }
-
-    $sessionId = $line.Substring($idCol, $idLen).Trim()
-    $idleStr   = if ($line.Length -ge ($idleCol + $idleLen)) {
-        $line.Substring($idleCol, $idleLen).Trim()
-    } else {
-        $line.Substring($idleCol).Trim()
+"@
     }
+} catch { return }   # WTS API/Add-Type unavailable -> do nothing (safe)
 
-    if ($sessionId -notmatch '^\d+$') { continue }
-    if ([int]$sessionId -le 0) { continue }
+$server = [IntPtr]::Zero   # WTS_CURRENT_SERVER_HANDLE
+$pp = [IntPtr]::Zero
+$count = 0
+if (-not [KhWts]::WTSEnumerateSessions($server, 0, 1, [ref]$pp, [ref]$count)) { return }
 
-    if ((Get-IdleMinutes $idleStr) -ge $Minutes) {
-        & logoff.exe $sessionId 2>$null
+try {
+    $sz = [System.Runtime.InteropServices.Marshal]::SizeOf([KhWts+SESSION_INFO])
+    for ($i = 0; $i -lt $count; $i++) {
+        $entry = [IntPtr]($pp.ToInt64() + ($i * $sz))
+        $si = [System.Runtime.InteropServices.Marshal]::PtrToStructure($entry, [KhWts+SESSION_INFO])
+        $sid = $si.SessionId
+        if ($sid -le 0) { continue }   # skip session 0 (services) and the console listener
+
+        $buf = [IntPtr]::Zero
+        $rb = 0
+        if (-not [KhWts]::WTSQuerySessionInformation($server, $sid, 24, [ref]$buf, [ref]$rb)) { continue }   # 24 = WTSSessionInfo
+        try {
+            $wi = [System.Runtime.InteropServices.Marshal]::PtrToStructure($buf, [KhWts+WTSINFO])
+        } catch {
+            continue
+        } finally {
+            if ($buf -ne [IntPtr]::Zero) { [KhWts]::WTSFreeMemory($buf) }
+        }
+
+        if (-not $wi.UserName) { continue }                                  # no logged-on user
+        if ($wi.LastInputTime -le 0 -or $wi.CurrentTime -le 0) { continue }  # times unreadable
+        $diff = $wi.CurrentTime - $wi.LastInputTime                          # 100ns ticks
+        if ($diff -lt 0) { continue }
+        $idleMin = [int]($diff / 600000000)                                  # ticks -> minutes
+        if ($idleMin -gt 44640) { continue }                                 # > 31 days -> implausible, skip
+
+        if ($idleMin -ge $Minutes) {
+            [KhWts]::WTSLogoffSession($server, $sid, $false) | Out-Null
+        }
     }
+} finally {
+    if ($pp -ne [IntPtr]::Zero) { [KhWts]::WTSFreeMemory($pp) }
 }
 '@ | Set-Content -Path $logoffScriptPath -Encoding UTF8
 
@@ -460,7 +587,14 @@ for ($i = 1; $i -lt $output.Count; $i++) {
         /F `
         /RU "SYSTEM" | Out-Null
 
-    Write-LogOk "Scheduled task created: $IdleTaskName (logs off sessions idle >= $IdleLogoffMinutes minutes)"
+    # schtasks is native: a nonzero exit is otherwise silently ignored. This task is
+    # the profile's core feature (idle logoff), so surface a failure via Write-Error
+    # (visible in console / Event Log) instead of logging a false success.
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "schtasks /Create failed for '$IdleTaskName' (exit $LASTEXITCODE) -- idle logoff NOT installed."
+    } else {
+        Write-LogOk "Scheduled task created: $IdleTaskName (logs off sessions idle >= $IdleLogoffMinutes minutes)"
+    }
 
     # ===========================
     # Display power policy (display off / sleep) and lock it
@@ -474,7 +608,7 @@ for ($i = 1; $i -lt $output.Count; $i++) {
     foreach ($p in @(
         "$powerPolicyPath\$subVideo\$displayTimeoutSetting",
         "$powerPolicyPath\$subSleep\$sleepTimeoutSetting"
-    )) { New-Item -Path $p -Force | Out-Null }
+    )) { if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null } }
 
     New-ItemProperty -Path "$powerPolicyPath\$subVideo\$displayTimeoutSetting" `
         -Name "ACSettingIndex" -PropertyType DWord -Value $DisplayOffMinutes -Force | Out-Null
@@ -494,11 +628,11 @@ for ($i = 1; $i -lt $output.Count; $i++) {
         "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Start",
         "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\Start"
     )) {
-        New-Item -Path $p -Force | Out-Null
+        if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
         New-ItemProperty -Path $p -Name "value" -PropertyType DWord -Value 1 -Force | Out-Null
     }
 
-    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" -Force | Out-Null
+    if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer")) { New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" -Force | Out-Null }
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" `
         -Name "ShowSleepOption" -PropertyType DWord -Value 0 -Force | Out-Null
 
@@ -508,7 +642,7 @@ for ($i = 1; $i -lt $output.Count; $i++) {
     $subButtons = "4f971e89-eebd-4455-a8de-9e59040e7347"
     $lidAction  = "5ca83367-6e45-459f-a27b-476b1d01c936"
 
-    New-Item -Path "$powerPolicyPath\$subButtons\$lidAction" -Force | Out-Null
+    if (-not (Test-Path "$powerPolicyPath\$subButtons\$lidAction")) { New-Item -Path "$powerPolicyPath\$subButtons\$lidAction" -Force | Out-Null }
     New-ItemProperty -Path "$powerPolicyPath\$subButtons\$lidAction" `
         -Name "ACSettingIndex" -PropertyType DWord -Value 1 -Force | Out-Null
     New-ItemProperty -Path "$powerPolicyPath\$subButtons\$lidAction" `
@@ -521,28 +655,60 @@ for ($i = 1; $i -lt $output.Count; $i++) {
     $resumeScriptPath = Join-Path $logoffScriptDir "LogoffOnResume.ps1"
 
     @'
+# Locale- and SKU-independent "logoff on resume": enumerate sessions via the WTS
+# API and log off any that have a logged-on user (no quser/logoff.exe). Fails
+# SAFE: only sessions with a non-empty user name and a positive id are touched.
+
 $ErrorActionPreference = 'Continue'
 
-$output = @(quser 2>$null)
-if ($output.Count -lt 2) { return }
+try {
+    if (-not ('KhWtsR' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class KhWtsR {
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern int WTSEnumerateSessions(IntPtr hServer, int Reserved, int Version, out IntPtr ppSessionInfo, out int pCount);
+    [DllImport("wtsapi32.dll")]
+    public static extern void WTSFreeMemory(IntPtr pMemory);
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern bool WTSQuerySessionInformation(IntPtr hServer, int SessionId, int WTSInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern bool WTSLogoffSession(IntPtr hServer, int SessionId, bool bWait);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SESSION_INFO { public int SessionId; public IntPtr pName; public int State; }
+}
+"@
+    }
+} catch { return }
 
-$header   = $output[0]
-$idCol    = $header.IndexOf('ID')
-$stateCol = $header.IndexOf('STATE')
+$server = [IntPtr]::Zero
+$pp = [IntPtr]::Zero
+$count = 0
+if (-not [KhWtsR]::WTSEnumerateSessions($server, 0, 1, [ref]$pp, [ref]$count)) { return }
 
-if ($idCol -lt 0 -or $stateCol -lt 0) { return }
-$idLen = $stateCol - $idCol
+try {
+    $sz = [System.Runtime.InteropServices.Marshal]::SizeOf([KhWtsR+SESSION_INFO])
+    for ($i = 0; $i -lt $count; $i++) {
+        $entry = [IntPtr]($pp.ToInt64() + ($i * $sz))
+        $si = [System.Runtime.InteropServices.Marshal]::PtrToStructure($entry, [KhWtsR+SESSION_INFO])
+        $sid = $si.SessionId
+        if ($sid -le 0) { continue }
 
-for ($i = 1; $i -lt $output.Count; $i++) {
-    $line = $output[$i]
-    if (-not $line -or -not $line.Trim()) { continue }
-    if ($line.Length -lt $stateCol) { continue }
+        $buf = [IntPtr]::Zero
+        $rb = 0
+        $user = ''
+        if ([KhWtsR]::WTSQuerySessionInformation($server, $sid, 5, [ref]$buf, [ref]$rb)) {   # 5 = WTSUserName
+            try { $user = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($buf) }
+            catch { $user = '' }
+            finally { if ($buf -ne [IntPtr]::Zero) { [KhWtsR]::WTSFreeMemory($buf) } }
+        }
+        if (-not $user) { continue }
 
-    $sessionId = $line.Substring($idCol, $idLen).Trim()
-    if ($sessionId -notmatch '^\d+$') { continue }
-    if ([int]$sessionId -le 0) { continue }
-
-    & logoff.exe $sessionId 2>$null
+        [KhWtsR]::WTSLogoffSession($server, $sid, $false) | Out-Null
+    }
+} finally {
+    if ($pp -ne [IntPtr]::Zero) { [KhWtsR]::WTSFreeMemory($pp) }
 }
 '@ | Set-Content -Path $resumeScriptPath -Encoding UTF8
 
@@ -580,6 +746,13 @@ for ($i = 1; $i -lt $output.Count; $i++) {
         -Force | Out-Null
 
     Write-LogOk "Scheduled task created: $resumeTaskName (logs off active sessions on wake/lid open)"
+
+    # --- Warn on Modern Standby (S0): resume logoff relies on Power-Troubleshooter
+    #     Event 1, which S0 / Connected Standby devices may not log on wake ---
+    $csEnabled = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power" -Name "CsEnabled" -ErrorAction SilentlyContinue).CsEnabled
+    if ($csEnabled -eq 1) {
+        Write-LogWarn "Modern Standby (S0 / Connected Standby) is enabled. 'Logoff On Resume' may not fire on this device (no Power-Troubleshooter Event 1 on wake)."
+    }
 
     # ===========================
     # Daily auto-update task
