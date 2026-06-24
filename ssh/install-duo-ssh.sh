@@ -136,7 +136,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.7.5"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -2065,6 +2065,12 @@ text = re.sub(
     r'(?m)^\s*AuthenticationMethods\s+publickey,keyboard-interactive:pam\b[^\n]*\n',
     '', text)
 
+# Restore any foreign directive we neutralized at install with the
+# recoverable sentinel (e.g. a pre-existing AuthenticationMethods that would
+# have shadowed Duo).  Strip the prefix to put the original line back in
+# force.  Drop-in snippets are restored separately, further below.
+text = re.sub(r'(?m)^# kh-duo-disabled: ', '', text)
+
 text = re.sub(r'\n{3,}', '\n\n', text)
 text = text.rstrip() + '\n'
 p.write_text(text)
@@ -2159,6 +2165,12 @@ PYEOF
 # restore them) and leave anything else in the snippet alone.
 # PasswordAuthentication only conflicts when --allow-password is on; in
 # default publickey+Duo mode we want it `no` and leave it alone.
+#
+# Separately, ANY `AuthenticationMethods` in a drop-in (whatever its value)
+# shadows the global `publickey,keyboard-interactive:pam` we append to the
+# main file — same "first occurrence wins" rule — so Duo silently never
+# runs.  We neutralize those unconditionally here; the main-file counterpart
+# is handled in patch_sshd_config.
 fix_sshd_config_d_overrides() {
     local d="/etc/ssh/sshd_config.d"
     [[ -d "$d" ]] || return 0
@@ -2197,6 +2209,29 @@ fix_sshd_config_d_overrides() {
                 ok "Disabled '${directive} no' in $f${line:+  (${line%%:*})}"
             fi
         done
+
+        # AuthenticationMethods is a different beast from the `no`-valued
+        # directives above: ANY value in a drop-in shadows the global
+        # `publickey,keyboard-interactive:pam` we append to the MAIN config,
+        # because drop-ins are Include'd ahead of it and sshd keeps the FIRST
+        # value it obtains — so Duo silently never runs (this is exactly the
+        # "installed fine but no Duo prompt" failure).  We never write
+        # AuthenticationMethods into a drop-in ourselves, so any occurrence
+        # here is foreign → neutralize unconditionally (same recoverable
+        # sentinel; our own Match-bypass blocks live in the main file).
+        if grep -qE '^[[:space:]]*AuthenticationMethods[[:space:]]' "$f"; then
+            if [[ $announced -eq 0 ]]; then
+                log "Checking $d/*.conf for directives that block Duo"
+                announced=1
+            fi
+            if [[ $touched -eq 0 ]]; then
+                backup_and_track "$f"
+                touched=1
+            fi
+            sed -i -E 's|^([[:space:]]*AuthenticationMethods[[:space:]].*)$|# kh-duo-disabled: \1|' "$f"
+            line="$(grep -nE '^# kh-duo-disabled: [[:space:]]*AuthenticationMethods\b' "$f" | head -1)"
+            ok "Disabled conflicting 'AuthenticationMethods' in $f${line:+  (${line%%:*})}"
+        fi
     done
     shopt -u nullglob
     return 0
@@ -2253,6 +2288,22 @@ text = re.sub(r'\n{3,}', '\n\n', text)
 text = text.rstrip() + '\n'
 p.write_text(text)
 PYEOF
+
+    # ── Neutralize any FOREIGN AuthenticationMethods in the MAIN file ──
+    # After the strip above our managed block is gone, so any
+    # AuthenticationMethods still present was put here by something else (a
+    # prior hardening pass, the cloud image, a hand edit).  sshd keeps the
+    # FIRST value it obtains and our fresh block is appended at EOF, so an
+    # earlier foreign line wins and Duo never runs.  Comment it with the same
+    # recoverable sentinel do_uninstall understands.  Commented lines start
+    # with '#', so re-runs are idempotent.  (The drop-in counterpart is
+    # handled by fix_sshd_config_d_overrides, which ran just before us.)
+    if grep -qE '^[[:space:]]*AuthenticationMethods[[:space:]]' "$SSHD_CONFIG"; then
+        local _am_lines
+        _am_lines="$(grep -nE '^[[:space:]]*AuthenticationMethods[[:space:]]' "$SSHD_CONFIG" | cut -d: -f1 | tr '\n' ' ')"
+        sed -i -E 's|^([[:space:]]*AuthenticationMethods[[:space:]].*)$|# kh-duo-disabled: \1|' "$SSHD_CONFIG"
+        warn "Neutralized pre-existing AuthenticationMethods in $SSHD_CONFIG (line(s): ${_am_lines% }) — would have shadowed Duo"
+    fi
 
     # KbdInteractiveAuthentication / ChallengeResponseAuthentication
     if grep -qE '^\s*#?\s*KbdInteractiveAuthentication\b' "$SSHD_CONFIG"; then
