@@ -136,7 +136,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.5"
+SCRIPT_VERSION="1.7.6"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1584,10 +1584,10 @@ ensure_python3() {
     log "Installing python3 (required for safe PAM/sshd_config patching)"
     if [[ "$OS_FAMILY" == "debian" ]]; then
         export DEBIAN_FRONTEND=noninteractive
-        apt_get update -qq
-        apt_get install -y python3 >/dev/null
+        apt_get update -qq          || die_apt_broken "apt-get update (installing the python3 prerequisite)"
+        apt_get install -y python3  || die_apt_broken "installing python3"
     elif [[ "$OS_FAMILY" == "rhel" ]]; then
-        $PKG_MGR install -y python3 >/dev/null
+        $PKG_MGR install -y python3 || die "Failed to install python3 via $PKG_MGR. Fix the package manager (e.g. '$PKG_MGR clean all', resolve repo/network issues) and re-run this installer."
     fi
     command -v python3 >/dev/null 2>&1 || die "python3 is required but could not be installed."
 }
@@ -1798,11 +1798,37 @@ check_authorized_keys() {
 APT_GET_OPTS=(-o DPkg::Lock::Timeout=120)
 apt_get() { apt-get "${APT_GET_OPTS[@]}" "$@"; }
 
+# Shared guidance for when an apt/dpkg step fails.  Historically the dependency
+# install below sent its output to /dev/null, so on a host with a broken package
+# state (a half-configured or crashing maintainer script — e.g. a segfaulting
+# python3 breaks every python-based postinst) the step failed, `set -e` exited
+# the whole script, and the user saw NOTHING: the installer just returned to the
+# prompt with no error.  Now every apt step routes failures here for a clear,
+# actionable message instead of a silent abort.
+die_apt_broken() {
+    err "apt/dpkg step failed: $1"
+    die "The host's package manager could not complete that step.  Usually it is a
+broken package state (a half-configured or crashing maintainer script blocking
+apt); for an 'apt-get update' failure it may instead be a network or repository
+problem.  This is a problem with the machine, not with Duo.  Repair it, then
+re-run this installer:
+
+    sudo dpkg --configure -a
+    sudo apt-get -f install
+    sudo apt-get update          # if it is a repo/network issue
+
+If a package's maintainer script segfaults or loops (check 'dmesg | tail' and
+'sudo dpkg --audit'), that package is the culprit — neutralize or reinstall it
+before retrying."
+}
+
 install_duo_apt() {
     log "Adding Duo official APT repository (pkg.duosecurity.com)"
-    apt_get install -y -qq apt-transport-https curl gnupg >/dev/null 2>&1
+    apt_get install -y -qq apt-transport-https curl gnupg \
+        || die_apt_broken "installing prerequisites (apt-transport-https curl gnupg)"
 
-    curl -sSL https://duo.com/DUO-GPG-PUBLIC-KEY.asc | gpg --dearmor -o /usr/share/keyrings/duo-archive-keyring.gpg
+    curl -fsSL https://duo.com/DUO-GPG-PUBLIC-KEY.asc | gpg --dearmor -o /usr/share/keyrings/duo-archive-keyring.gpg \
+        || die "Failed to fetch/import Duo's GPG signing key — check connectivity to duo.com (and that gpg installed above) and retry."
 
     . /etc/os-release
     local codename="${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null || echo stable)}"
@@ -1829,8 +1855,8 @@ install_duo_apt() {
     ok "Added Duo repo: ${repo_url} ${codename}"
 
     export DEBIAN_FRONTEND=noninteractive
-    apt_get update -qq
-    apt_get install -y duo-unix
+    apt_get update -qq                  || die_apt_broken "apt-get update (after adding the Duo repo)"
+    apt_get install -y duo-unix         || die_apt_broken "installing the duo-unix package"
 }
 
 install_duo_yum() {
@@ -2163,8 +2189,13 @@ PYEOF
 #
 # We comment those lines out (with a sentinel prefix so uninstall can
 # restore them) and leave anything else in the snippet alone.
-# PasswordAuthentication only conflicts when --allow-password is on; in
-# default publickey+Duo mode we want it `no` and leave it alone.
+#
+# PasswordAuthentication is handled in its own block below: a drop-in pinning
+# the OPPOSITE of what this install wants shadows the value we set in the main
+# file.  In default publickey+Duo mode we want `no`, so a drop-in `yes`
+# (cloud-init's 50-cloud-init.conf ships exactly that) silently leaves
+# password login ENABLED — a real security gap, not just a Duo one.  In
+# --allow-password mode we want `yes`, so a drop-in `no` blocks the fallback.
 #
 # Separately, ANY `AuthenticationMethods` in a drop-in (whatever its value)
 # shadows the global `publickey,keyboard-interactive:pam` we append to the
@@ -2182,9 +2213,13 @@ fix_sshd_config_d_overrides() {
         'KbdInteractiveAuthentication'
         'ChallengeResponseAuthentication'
     )
-    if [[ $ALLOW_PASSWORD -eq 1 ]]; then
-        conflicts+=('PasswordAuthentication')
-    fi
+
+    # What this install wants for PasswordAuthentication, and the drop-in value
+    # that would shadow it.  We set the wanted value in the main config, but a
+    # drop-in pinning the opposite is Include'd first and wins ("first
+    # occurrence wins"), so we neutralize the conflicting one (see block below).
+    local pw_want pw_bad
+    if [[ $ALLOW_PASSWORD -eq 1 ]]; then pw_want="yes"; pw_bad="no"; else pw_want="no"; pw_bad="yes"; fi
 
     shopt -s nullglob
     local f directive line announced=0
@@ -2231,6 +2266,25 @@ fix_sshd_config_d_overrides() {
             sed -i -E 's|^([[:space:]]*AuthenticationMethods[[:space:]].*)$|# kh-duo-disabled: \1|' "$f"
             line="$(grep -nE '^# kh-duo-disabled: [[:space:]]*AuthenticationMethods\b' "$f" | head -1)"
             ok "Disabled conflicting 'AuthenticationMethods' in $f${line:+  (${line%%:*})}"
+        fi
+
+        # PasswordAuthentication: neutralize a drop-in pinning the value that
+        # CONFLICTS with what this install wants ($pw_bad).  In default mode
+        # $pw_bad is `yes` — so a cloud image's `PasswordAuthentication yes`
+        # drop-in, which otherwise shadows our main-config `no` and leaves
+        # password login quietly open, gets disabled here.
+        if grep -qE "^[[:space:]]*PasswordAuthentication[[:space:]]+${pw_bad}\b" "$f"; then
+            if [[ $announced -eq 0 ]]; then
+                log "Checking $d/*.conf for directives that block Duo"
+                announced=1
+            fi
+            if [[ $touched -eq 0 ]]; then
+                backup_and_track "$f"
+                touched=1
+            fi
+            sed -i -E "s|^([[:space:]]*PasswordAuthentication[[:space:]]+${pw_bad}\b.*)$|# kh-duo-disabled: \1|" "$f"
+            line="$(grep -nE '^# kh-duo-disabled: [[:space:]]*PasswordAuthentication\b' "$f" | head -1)"
+            warn "Disabled conflicting 'PasswordAuthentication ${pw_bad}' in $f${line:+  (${line%%:*})} — install wants '${pw_want}'"
         fi
     done
     shopt -u nullglob
