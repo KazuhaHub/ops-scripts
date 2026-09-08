@@ -15,7 +15,8 @@
 #   - /etc/ssh/sshd_config: AuthenticationMethods publickey,keyboard-interactive:pam
 #
 # Login flow after install: SSH publickey  +  Duo Push/Passcode
-# Password-only login is rejected.
+# By default, password-only login is rejected.  --allow-password enables the
+# password fallback policy described below.
 #
 # Usage:
 #   sudo ./install-duo-ssh.sh                      # interactive menu (TTY) — guided setup
@@ -23,9 +24,13 @@
 #   sudo ./install-duo-ssh.sh --ikey X --skey Y --host Z
 #   sudo DUO_IKEY=X DUO_SKEY=Y DUO_HOST=Z ./install-duo-ssh.sh --yes
 #   sudo ./install-duo-ssh.sh --breakglass emergency   # exempt a user from Duo
+#                                                        (password is also accepted when
+#                                                        --allow-password is enabled)
 #   sudo ./install-duo-ssh.sh --no-bypass-local         # disable default localhost bypass
 #   sudo ./install-duo-ssh.sh --bypass-addr 10.0.0.0/8 # extra CIDRs to bypass Duo
-#   sudo ./install-duo-ssh.sh --allow-password         # also allow password+Duo via PAM (publickey users still skip password)
+#   sudo ./install-duo-ssh.sh --allow-password         # allow password fallback everywhere:
+#                                                        password+Duo normally, password-only
+#                                                        for bypass addresses/users
 #   sudo ./install-duo-ssh.sh --failmode safe          # default — when Duo cloud is unreachable,
 #                                                        let publickey/password through (no Duo step)
 #   sudo ./install-duo-ssh.sh --failmode secure        # stricter — reject login outright when Duo
@@ -136,7 +141,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.6"
+SCRIPT_VERSION="1.7.7"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -206,6 +211,7 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 PAM_SSHD="/etc/pam.d/sshd"
 PAM_DUO_CONF="/etc/duo/pam_duo.conf"
 LOGIN_DUO_CONF="/etc/duo/login_duo.conf"
+PAM_BYPASS_CONF="/etc/security/kh-duo-bypass.conf"
 
 # Detected at runtime
 OS_FAMILY=""    # debian | rhel
@@ -1039,6 +1045,7 @@ menu_uninstall_flow() {
     echo
     warn "Uninstall will:"
     echo "    - remove the Duo PAM stack from $PAM_SSHD"
+    echo "    - remove the managed bypass selector at $PAM_BYPASS_CONF"
     echo "    - remove AuthenticationMethods from $SSHD_CONFIG"
     echo "    - uninstall the duo-unix package and its repo entry"
     echo "    - restart sshd"
@@ -1176,7 +1183,7 @@ print_config_summary() {
     API host:         ${HOST:-(not set)}
 
   Login policy
-    Auth mode:        $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey OR password + Duo' || echo 'publickey + Duo only')
+    Auth mode:        $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password fallback ON everywhere (+ Duo unless bypassed)' || echo 'publickey + Duo only')
     Failmode:         $FAILMODE  ($([[ "$FAILMODE" == "secure" ]] && echo 'DENY login if Duo cloud unreachable' || echo 'allow first-factor if Duo cloud unreachable'))
     Localhost bypass: $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
     Extra bypass:     ${BYPASS_ADDRS:-(none)}
@@ -1318,13 +1325,14 @@ install_wizard() {
     local pw_default
     if [[ $has_keys -eq 1 ]]; then
         ok   "  Detected SSH key(s) — recommending publickey-only mode."
-        echo "  Allow password+Duo as a fallback for users without SSH keys?"
+        echo "  Allow password fallback for users without SSH keys? (Duo unless bypassed)"
         pw_default="n"
     else
         warn "  No SSH keys detected on this server."
-        warn "  Without a key, you can ONLY log in with password+Duo."
+        warn "  Without a key, you can ONLY log in with the password fallback"
+        warn "  (password+Duo normally; password-only in configured bypass scopes)."
         warn "  STRONGLY RECOMMENDED: add an SSH public key first, then re-run this script."
-        echo "  Defaulting to ALLOW password+Duo to prevent lockout. Force publickey-only?"
+        echo "  Defaulting to ALLOW password fallback to prevent lockout. Force publickey-only?"
         pw_default="y"   # default to "yes allow password" (i.e. answer "n" to the inverted "force publickey-only")
     fi
 
@@ -1362,6 +1370,7 @@ install_wizard() {
     echo
     log "Step 3/5 — Localhost Bypass"
     echo "  Skip Duo for connections from 127.0.0.0/8 and ::1"
+    echo "  (with password fallback ON: accept publickey or password; otherwise publickey only)"
     echo "  (recommended — lets local cron jobs and scripts SSH to themselves)."
     if menu_yes_no "Bypass Duo for localhost?" "y"; then
         BYPASS_LOCAL=1
@@ -1373,6 +1382,7 @@ install_wizard() {
     echo
     log "Step 4/5 — Extra Bypass CIDRs (optional)"
     echo "  Comma-separated networks that skip Duo (e.g. 10.0.0.0/8,192.168.0.0/16)."
+    echo "  Password fallback, when enabled, also works in these networks without Duo."
     echo "  Press Enter to skip."
     local extra=""
     menu_ask extra "Bypass CIDRs"
@@ -1381,7 +1391,8 @@ install_wizard() {
     # ── Step 5/5 — breakglass user ─────────────────────────────────────
     echo
     log "Step 5/5 — Breakglass User (optional)"
-    echo "  A username that bypasses Duo entirely (publickey only)."
+    echo "  A username that bypasses Duo entirely."
+    echo "  Password fallback, when enabled, also applies to this user without Duo."
     echo "  For emergency recovery — use sparingly.  Press Enter to skip."
     local bg=""
     menu_ask bg "Breakglass username"
@@ -1396,7 +1407,7 @@ install_wizard() {
   Action:               Install / configure
   ikey:                 ${IKEY:0:8}…
   host:                 $HOST
-  Password fallback:    $([[ $ALLOW_PASSWORD -eq 1 ]] && echo "yes (publickey OR password+Duo)" || echo "no  (publickey+Duo only)")
+  Password fallback:    $([[ $ALLOW_PASSWORD -eq 1 ]] && echo "yes (all scopes; Duo skipped in bypass scopes)" || echo "no  (publickey+Duo only)")
   Failmode (Duo down):  $([[ "$FAILMODE" == "secure" ]] && echo "secure (DENY when Duo unreachable)" || echo "safe   (allow first-factor when Duo unreachable)")
   Localhost bypass:     $([[ $BYPASS_LOCAL -eq 1 ]] && echo "yes (127.0.0.0/8, ::1)" || echo "no")
   Extra bypass CIDRs:   ${BYPASS_ADDRS:-(none)}
@@ -1592,6 +1603,55 @@ ensure_python3() {
     command -v python3 >/dev/null 2>&1 || die "python3 is required but could not be installed."
 }
 
+# Normalize address bypasses once before either sshd_config or PAM consumes
+# them.  OpenSSH accepts CIDRs (and individual addresses); pam_access accepts
+# the same network/mask form.  Canonicalizing here keeps both policy layers in
+# lockstep and prevents whitespace/config-line injection through a malformed
+# --bypass-addr value.
+validate_bypass_policy() {
+    if [[ -n "$BYPASS_ADDRS" ]]; then
+        local normalized
+        if ! normalized="$(python3 - "$BYPASS_ADDRS" <<'PYEOF'
+import ipaddress
+import sys
+
+raw = sys.argv[1]
+items = raw.split(',')
+out = []
+seen = set()
+
+for value in items:
+    value = value.strip()
+    if not value:
+        print("empty entry in bypass CIDR list", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as exc:
+        print(f"invalid bypass address/CIDR {value!r}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    canonical = str(network)
+    if canonical not in seen:
+        seen.add(canonical)
+        out.append(canonical)
+
+print(','.join(out))
+PYEOF
+        )"; then
+            die "Invalid --bypass-addr value. Use comma-separated IPv4/IPv6 addresses or CIDRs whose host bits are zero."
+        fi
+        BYPASS_ADDRS="$normalized"
+    fi
+
+    if [[ -n "$BREAKGLASS_USER" ]]; then
+        if [[ ! "$BREAKGLASS_USER" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            die "Invalid breakglass username '$BREAKGLASS_USER' (only letters, digits, dot, underscore, and hyphen are supported)."
+        fi
+        getent passwd "$BREAKGLASS_USER" >/dev/null 2>&1 \
+            || die "Breakglass user '$BREAKGLASS_USER' does not exist. Create it first or clear --breakglass."
+    fi
+}
+
 detect_os() {
     [[ -f /etc/os-release ]] || die "Cannot detect OS (no /etc/os-release)"
     . /etc/os-release
@@ -1633,8 +1693,8 @@ detect_os() {
 }
 
 ### ─── Backup / rollback ─────────────────────────────────────────────────
-# Files outside the three "well-known" paths (sshd_config, pam.d/sshd,
-# pam_duo.conf) that the run modified — most commonly *.conf snippets in
+# Files outside the four "well-known" paths (sshd_config, pam.d/sshd,
+# pam_duo.conf, kh-duo-bypass.conf) that the run modified — most commonly *.conf snippets in
 # /etc/ssh/sshd_config.d/ that we had to rewrite to lift a conflicting
 # `KbdInteractiveAuthentication no` (see fix_sshd_config_d_overrides).
 # Tracked with full path so rollback knows where to put them back.
@@ -1663,6 +1723,11 @@ rollback() {
     [[ -f "$BACKUP_DIR/sshd_config" ]]  && cp -a "$BACKUP_DIR/sshd_config"  "$SSHD_CONFIG"
     [[ -f "$BACKUP_DIR/sshd" ]]         && cp -a "$BACKUP_DIR/sshd"         "$PAM_SSHD"
     [[ -f "$BACKUP_DIR/pam_duo.conf" ]] && cp -a "$BACKUP_DIR/pam_duo.conf" "$PAM_DUO_CONF"
+    if [[ -f "$BACKUP_DIR/$(basename "$PAM_BYPASS_CONF")" ]]; then
+        cp -a "$BACKUP_DIR/$(basename "$PAM_BYPASS_CONF")" "$PAM_BYPASS_CONF"
+    elif [[ -f "$BACKUP_DIR/.pam_bypass_conf_absent" ]]; then
+        rm -f "$PAM_BYPASS_CONF"
+    fi
     # Restore any extra files we touched (e.g. sshd_config.d/*.conf snippets
     # whose `KbdInteractiveAuthentication no` we had to disable).  Indirect
     # expansion guarded with :- so an empty array under set -u doesn't bomb.
@@ -1734,6 +1799,80 @@ find_pam_duo_so() {
     return 1
 }
 
+find_pam_access_so() {
+    local candidates=(
+        /lib64/security/pam_access.so
+        /lib/security/pam_access.so
+        /lib/x86_64-linux-gnu/security/pam_access.so
+        /usr/lib64/security/pam_access.so
+        /usr/lib/x86_64-linux-gnu/security/pam_access.so
+        /usr/lib/security/pam_access.so
+    )
+    # Debian multiarch paths vary by CPU (aarch64, arm-linux-gnueabihf, …).
+    shopt -s nullglob
+    candidates+=(
+        /lib/*-linux-gnu/security/pam_access.so
+        /usr/lib/*-linux-gnu/security/pam_access.so
+    )
+    shopt -u nullglob
+    local p
+    for p in "${candidates[@]}"; do
+        [[ -f "$p" ]] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+has_duo_bypass() {
+    [[ $BYPASS_LOCAL -eq 1 || -n "$BYPASS_ADDRS" || -n "$BREAKGLASS_USER" ]]
+}
+
+is_managed_pam_bypass_config() {
+    [[ -f "$PAM_BYPASS_CONF" ]] \
+        && grep -qF '# Managed by install-duo-ssh.sh — used only as a Duo bypass selector.' "$PAM_BYPASS_CONF"
+}
+
+# pam_access is used as a selector, not as the final access decision:
+#   '-' rule matched  -> its PAM_PERM_DENIED result jumps over Duo+pam_deny
+#   '+' catch-all     -> PAM_SUCCESS is ignored and normal Duo auth continues
+# The password itself has already passed pam_unix before this selector runs.
+# This gives --allow-password identical reach everywhere while retaining the
+# meaning of a bypass: password authentication succeeds there without Duo.
+write_pam_bypass_config() {
+    local origins=""
+    if [[ $BYPASS_LOCAL -eq 1 ]]; then
+        origins="127.0.0.0/8 ::1"
+    fi
+    if [[ -n "$BYPASS_ADDRS" ]]; then
+        local extra_origins="${BYPASS_ADDRS//,/ }"
+        origins="${origins:+$origins }$extra_origins"
+    fi
+
+    if [[ -e "$PAM_BYPASS_CONF" ]] && ! is_managed_pam_bypass_config; then
+        die "Refusing to overwrite unrelated file at $PAM_BYPASS_CONF. Move it aside and retry."
+    fi
+
+    mkdir -p "$(dirname "$PAM_BYPASS_CONF")"
+    umask 077
+    local tmp
+    tmp="$(mktemp)" || die "mktemp failed while writing $PAM_BYPASS_CONF"
+    {
+        echo "# Managed by install-duo-ssh.sh — used only as a Duo bypass selector."
+        echo "# '-' means skip Duo after a valid password; '+' means continue to Duo."
+        [[ -n "$BREAKGLASS_USER" ]] && printf -- '-:%s:ALL\n' "$BREAKGLASS_USER"
+        [[ -n "$origins" ]] && printf -- '-:ALL:%s\n' "$origins"
+        echo "+:ALL:ALL"
+    } > "$tmp"
+
+    install -m 600 -o root -g root "$tmp" "$PAM_BYPASS_CONF" 2>/dev/null || {
+        cp "$tmp" "$PAM_BYPASS_CONF"
+        chmod 600 "$PAM_BYPASS_CONF"
+        chown root:root "$PAM_BYPASS_CONF" 2>/dev/null || true
+    }
+    rm -f "$tmp"
+    command -v restorecon >/dev/null 2>&1 && restorecon -F "$PAM_BYPASS_CONF" >/dev/null 2>&1 || true
+    ok "Wrote password/Duo bypass selector: $PAM_BYPASS_CONF"
+}
+
 restart_sshd() {
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service sshd restart 2>/dev/null
 }
@@ -1768,7 +1907,7 @@ check_authorized_keys() {
     fi
 
     if [[ $ALLOW_PASSWORD -eq 1 ]]; then
-        warn "No SSH keys found — proceeding with password+key+Duo (--allow-password set)."
+        warn "No SSH keys found — proceeding with password fallback (--allow-password set; Duo is skipped only in bypass scopes)."
         warn "STRONGLY RECOMMENDED: add an SSH public key and rerun this script to disable password fallback."
         return 0
     fi
@@ -1776,8 +1915,8 @@ check_authorized_keys() {
     # Auto-adapt: enable password fallback so admin doesn't lock themselves out.
     warn "============================================================"
     warn "  No SSH authorized_keys found for root${SUDO_USER:+ or $SUDO_USER}."
-    warn "  Auto-enabling password fallback (publickey OR password + Duo)."
-    warn "  Without a key, every login uses your account password + Duo."
+    warn "  Auto-enabling password fallback (password + Duo unless bypassed)."
+    warn "  Without a key, every login uses your account password; non-bypass logins also require Duo."
     warn ""
     warn "  STRONGLY RECOMMENDED: add an SSH public key and rerun this"
     warn "  script (or pass --strict-publickey) to switch to key-only mode."
@@ -1969,11 +2108,15 @@ duo_version_ok() {
 #
 #   --allow-password (also accept password+Duo via PAM):
 #       auth  requisite  pam_unix.so nullok try_first_pass
+#       auth  [success=ignore perm_denied=2 default=ignore] pam_access.so ...
 #       auth  sufficient pam_duo.so
 #       auth  required   pam_deny.so
 #     With AuthenticationMethods 'publickey,keyboard-interactive:pam keyboard-interactive:pam'
 #     keyless users can log in with password+Duo.  Publickey users get an
 #     extra password prompt during the kbdint stage — accepted trade-off.
+#     The pam_access selector is present only when a bypass exists.  A valid
+#     password from a bypass address/user skips the following Duo+pam_deny
+#     pair, so password fallback remains available without defeating bypass.
 #
 # The block is wrapped in begin/end markers so re-runs (including mode
 # switches) replace it cleanly.
@@ -1981,12 +2124,28 @@ patch_pam() {
     local pam_duo_so="$1"
     local allow_password="$2"
     local os_family="$3"
+    local pam_access_so="${4:-}"
+    local password_bypass="${5:-0}"
+    local pam_bypass_conf="${6:-}"
+    local access_quiet="${7:-0}"
 
-    python3 - "$PAM_SSHD" "$pam_duo_so" "$allow_password" "$os_family" <<'PYEOF'
+    python3 - "$PAM_SSHD" "$pam_duo_so" "$allow_password" "$os_family" \
+        "$pam_access_so" "$password_bypass" "$pam_bypass_conf" "$access_quiet" <<'PYEOF'
 import sys, re, pathlib
 
-path, pam_duo_so, allow_password, os_family = sys.argv[1:5]
+(
+    path,
+    pam_duo_so,
+    allow_password,
+    os_family,
+    pam_access_so,
+    password_bypass,
+    pam_bypass_conf,
+    access_quiet,
+) = sys.argv[1:9]
 allow_password = (allow_password == "1")
+password_bypass = (password_bypass == "1")
+access_quiet = (access_quiet == "1")
 p = pathlib.Path(path)
 text = p.read_text()
 
@@ -2007,12 +2166,21 @@ text = re.sub(r'^\s*auth\s+required\s+pam_deny\.so\s*\n', '', text, flags=re.MUL
 
 # 3. Build the new managed block.
 if allow_password:
+    bypass_selector = ""
+    if password_bypass:
+        quiet_option = " quiet_log" if access_quiet else ""
+        bypass_selector = (
+            "auth  [success=ignore perm_denied=2 default=ignore] "
+            f"{pam_access_so} accessfile={pam_bypass_conf} "
+            f"noaudit nodefgroup{quiet_option}\n"
+        )
     new_block = (
         "# duo-stack-begin (managed by install-duo-ssh.sh — do not edit)\n"
         "auth  requisite  pam_unix.so nullok try_first_pass\n"
-        f"auth  sufficient {pam_duo_so}\n"
-        "auth  required   pam_deny.so\n"
-        "# duo-stack-end\n"
+        + bypass_selector
+        + f"auth  sufficient {pam_duo_so}\n"
+        + "auth  required   pam_deny.so\n"
+        + "# duo-stack-end\n"
     )
 else:
     new_block = (
@@ -2055,7 +2223,7 @@ if not injected:
 p.write_text("".join(out))
 PYEOF
     if [[ "$allow_password" == "1" ]]; then
-        ok "Patched $PAM_SSHD (publickey+Duo OR password+Duo)"
+        ok "Patched $PAM_SSHD (password fallback enabled; Duo skipped only in bypass scopes)"
     else
         ok "Patched $PAM_SSHD (publickey+Duo only)"
     fi
@@ -2067,6 +2235,7 @@ do_uninstall() {
     uninstall_auto_update
     backup_file "$SSHD_CONFIG"
     backup_file "$PAM_SSHD"
+    backup_file "$PAM_BYPASS_CONF"
 
     # Remove the script-managed Duo block from sshd_config.
     # Same two-pass strip as apply_sshd: new sentinel format first, then
@@ -2136,6 +2305,9 @@ for line in lines:
     out.append(line)
 p.write_text("".join(out))
 PYEOF
+
+    # Remove our selector after removing the only PAM block that references it.
+    is_managed_pam_bypass_config && rm -f "$PAM_BYPASS_CONF"
 
     # Restore any sshd_config.d/*.conf snippets we disabled during install.
     # Lines were prefixed with "# kh-duo-disabled: " by fix_sshd_config_d_overrides;
@@ -2422,11 +2594,15 @@ PYEOF
     #                    (so publickey users see one password+Duo prompt set);
     #                    the second alternative `keyboard-interactive:pam`
     #                    lets keyless users authenticate via password+Duo.
+    #                    Inside bypass Match blocks, publickey and keyboard-
+    #                    interactive are independent alternatives.  The PAM
+    #                    selector verifies the password and skips Duo there.
     #                    We avoid `password,keyboard-interactive:pam` because
     #                    it would invoke PAM twice and double-prompt.
-    local auth_line
+    local auth_line bypass_auth_line="AuthenticationMethods publickey"
     if [[ $ALLOW_PASSWORD -eq 1 ]]; then
         auth_line='AuthenticationMethods publickey,keyboard-interactive:pam keyboard-interactive:pam'
+        bypass_auth_line='AuthenticationMethods publickey keyboard-interactive:pam'
     else
         auth_line='AuthenticationMethods publickey,keyboard-interactive:pam'
     fi
@@ -2443,21 +2619,21 @@ PYEOF
             [[ -n "$BYPASS_ADDRS" ]] && local_addrs="${local_addrs},${BYPASS_ADDRS}"
 
             echo ""
-            echo "# Bypass Duo for localhost (publickey-only)"
+            echo "# Bypass Duo for localhost ($([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey or password' || echo 'publickey-only'))"
             echo "Match Address $local_addrs"
-            echo "    AuthenticationMethods publickey"
+            echo "    $bypass_auth_line"
         elif [[ -n "$BYPASS_ADDRS" ]]; then
             echo ""
-            echo "# Bypass Duo for specified addresses (publickey-only)"
+            echo "# Bypass Duo for specified addresses ($([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey or password' || echo 'publickey-only'))"
             echo "Match Address $BYPASS_ADDRS"
-            echo "    AuthenticationMethods publickey"
+            echo "    $bypass_auth_line"
         fi
 
         if [[ -n "$BREAKGLASS_USER" ]]; then
             echo ""
-            echo "# Emergency access: bypass Duo for this user (publickey-only)"
+            echo "# Emergency access: bypass Duo for this user ($([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey or password' || echo 'publickey-only'))"
             echo "Match User $BREAKGLASS_USER"
-            echo "    AuthenticationMethods publickey"
+            echo "    $bypass_auth_line"
         fi
 
         echo "# kh-duo-sshd-end"
@@ -2465,7 +2641,7 @@ PYEOF
     ok "Added AuthenticationMethods"
     if [[ $BYPASS_LOCAL -eq 1 ]];      then ok "Bypass Duo for localhost and self connections"; fi
     if [[ -n "$BYPASS_ADDRS" ]];       then ok "Bypass Duo for: $BYPASS_ADDRS"; fi
-    if [[ -n "$BREAKGLASS_USER" ]];    then ok "Breakglass user: $BREAKGLASS_USER (bypasses Duo)"; fi
+    if [[ -n "$BREAKGLASS_USER" ]];    then ok "Breakglass user: $BREAKGLASS_USER (bypasses Duo; $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey or password' || echo 'publickey-only'))"; fi
     return 0   # explicit success — bare `[[ ]] && ...` chains above can leak a non-zero exit when all conditions are false, which set -e would treat as a function failure and roll back the whole install
 }
 
@@ -2781,12 +2957,38 @@ fi
 
 [[ -n "$IKEY" && -n "$SKEY" && -n "$HOST" ]] || die "ikey/skey/host all required."
 
+validate_bypass_policy
+
+# Password fallback inside a Duo-bypass Match needs a PAM-layer selector:
+# sshd can choose which authentication methods are allowed by source/user,
+# but only PAM can skip pam_duo after validating a password.  pam_access is
+# part of the base PAM packages on every supported distribution.
+PASSWORD_BYPASS=0
+PAM_ACCESS_SO=""
+PAM_ACCESS_QUIET=0
+if [[ $ALLOW_PASSWORD -eq 1 ]] && has_duo_bypass; then
+    PASSWORD_BYPASS=1
+    PAM_ACCESS_SO="$(find_pam_access_so)" \
+        || die "pam_access.so is required for password fallback in Duo-bypass scopes. Install the base PAM modules package (libpam-modules on Debian/Ubuntu, pam on RHEL-family) and retry."
+    # quiet_log is newer than some supported PAM releases.  Pass it only when
+    # the installed module advertises the option; older modules remain usable
+    # (they may emit one harmless selector-denial log for a bypass login).
+    if grep -a -q 'quiet_log' "$PAM_ACCESS_SO" 2>/dev/null; then
+        PAM_ACCESS_QUIET=1
+    fi
+fi
+
 ### 3. Backup everything we're about to touch
 log "Backing up to $BACKUP_DIR"
 mkdir -p "$BACKUP_DIR"
 backup_file "$SSHD_CONFIG"
 backup_file "$PAM_SSHD"
 backup_file "$PAM_DUO_CONF"
+if [[ -f "$PAM_BYPASS_CONF" ]]; then
+    backup_file "$PAM_BYPASS_CONF"
+else
+    : > "$BACKUP_DIR/.pam_bypass_conf_absent"
+fi
 ok "Backups saved"
 
 trap 'rollback' ERR
@@ -2807,9 +3009,20 @@ chmod 600 "$PAM_DUO_CONF"
 chown root:root "$PAM_DUO_CONF"
 ok "Credentials written (failmode=$FAILMODE)"
 
+### 4.5. Write the PAM source/user selector used by bypass password auth
+if [[ $PASSWORD_BYPASS -eq 1 ]]; then
+    write_pam_bypass_config
+elif is_managed_pam_bypass_config; then
+    # Switching password fallback off (or clearing every bypass) makes the
+    # selector unused.  Remove stale managed state; rollback restores it if a
+    # later validation/restart step fails.
+    rm -f "$PAM_BYPASS_CONF"
+fi
+
 ### 5. Patch /etc/pam.d/sshd
 log "Patching $PAM_SSHD"
-patch_pam "$PAM_DUO_SO" "$ALLOW_PASSWORD" "$OS_FAMILY"
+patch_pam "$PAM_DUO_SO" "$ALLOW_PASSWORD" "$OS_FAMILY" \
+    "$PAM_ACCESS_SO" "$PASSWORD_BYPASS" "$PAM_BYPASS_CONF" "$PAM_ACCESS_QUIET"
 
 ### 6. Patch /etc/ssh/sshd_config
 # Pre-flight: lift any `KbdInteractiveAuthentication no` / `ChallengeResponseAuthentication no`
@@ -2856,12 +3069,12 @@ cat <<EOF
 ║  OS:                 $(printf '%-49s' "${PRETTY_NAME:-$ID}")║
 ║  Duo version:        $(printf '%-49s' "$(get_duo_version)")║
 ║  pam_duo.so:         $(printf '%-49s' "$PAM_DUO_SO")║
-║  Login requirement:  $(printf '%-49s' "publickey$( [[ $ALLOW_PASSWORD -eq 1 ]] && echo ' OR password') + Duo")║
+║  Login requirement:  $(printf '%-49s' "$([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password fallback everywhere (+ Duo unless bypass)' || echo 'publickey + Duo')")║
 EOF
 # Conditional row — split out of the heredoc so an empty BREAKGLASS_USER
 # doesn't leave a blank, borderless line in the box.
 if [[ -n "$BREAKGLASS_USER" ]]; then
-    printf '║  Breakglass user:    %-49s║\n' "$BREAKGLASS_USER (publickey only)"
+    printf '║  Breakglass user:    %-49s║\n' "$BREAKGLASS_USER ($([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'publickey/password' || echo 'publickey only'))"
 fi
 cat <<EOF
 ║  Backups:            $(printf '%-49s' "$BACKUP_DIR")║
