@@ -37,7 +37,9 @@
 #                                                        cloud is unreachable (risk: Duo outage = lockout)
 #   sudo ./install-duo-ssh.sh --uninstall              # revert to stock SSH config
 #   sudo ./install-duo-ssh.sh --disable-duo            # pause Duo, retain credentials and policy
+#   sudo ./install-duo-ssh.sh --disable-duo --for 30m  # pause temporarily; auto-resume
 #   sudo ./install-duo-ssh.sh --enable-duo             # restore the saved Duo policy
+#   sudo ./install-duo-ssh.sh --doctor                 # inspect effective SSH login policy
 #   sudo ./install-duo-ssh.sh --no-menu                # force flag-driven mode even on TTY
 #
 # Maintenance:
@@ -101,6 +103,10 @@ BYPASS_LOCAL=1
 BYPASS_ADDRS=""
 ACTION_DISABLE_DUO=0
 ACTION_ENABLE_DUO=0
+ACTION_RESUME_IF_DUE=0
+ACTION_DOCTOR=0
+PAUSE_DURATION=""
+PAUSE_RESUME_AT=""
 PAUSE_ONLY=0
 ALLOW_PASSWORD=0
 # pam_duo failmode: how PAM behaves when the Duo cloud is unreachable.
@@ -146,7 +152,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.8"
+SCRIPT_VERSION="1.7.9"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -207,6 +213,9 @@ AUTO_UPDATE_HOUR="04"
 AUTO_UPDATE_SYSTEMD_SERVICE="/etc/systemd/system/kh-duo-update.service"
 AUTO_UPDATE_SYSTEMD_TIMER="/etc/systemd/system/kh-duo-update.timer"
 AUTO_UPDATE_CRON_FILE="/etc/cron.d/kh-duo-update"
+RESUME_SYSTEMD_SERVICE="/etc/systemd/system/kh-duo-resume.service"
+RESUME_SYSTEMD_TIMER="/etc/systemd/system/kh-duo-resume.timer"
+RESUME_CRON_FILE="/etc/cron.d/kh-duo-resume"
 
 # Minimum required Duo Unix version (CA bundle expiry on 2026-04-15 — see docs)
 DUO_MIN_MAJOR=2
@@ -254,7 +263,10 @@ while [[ $# -gt 0 ]]; do
         --strict-publickey) STRICT_PUBLICKEY=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         --disable-duo)  ACTION_DISABLE_DUO=1; shift ;;
+        --for)          PAUSE_DURATION="${2:-}"; [[ -n "$PAUSE_DURATION" ]] || { echo "--for requires a duration (for example 30m or 2h)" >&2; exit 1; }; shift 2 ;;
         --enable-duo)   ACTION_ENABLE_DUO=1; shift ;;
+        --resume-if-due) ACTION_RESUME_IF_DUE=1; shift ;;
+        --doctor)       ACTION_DOCTOR=1; shift ;;
         --no-menu)      NO_MENU=1; shift ;;
         --check-update) ACTION_CHECK_UPDATE=1; shift ;;
         --update|--self-update) ACTION_SELF_UPDATE=1; shift ;;
@@ -274,6 +286,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown arg: $1" >&2; usage 1 ;;
     esac
 done
+[[ -z "$PAUSE_DURATION" || $ACTION_DISABLE_DUO -eq 1 ]] || { echo "--for requires --disable-duo" >&2; exit 1; }
+if (( ACTION_DISABLE_DUO + ACTION_ENABLE_DUO + ACTION_RESUME_IF_DUE > 1 )); then
+    echo "Choose one Duo on/off action" >&2
+    exit 1
+fi
 
 ### ─── UI helpers ─────────────────────────────────────────────────────────
 log()   { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
@@ -1016,6 +1033,81 @@ auto_update_status() {
     printf '(disabled)'
 }
 
+parse_pause_duration() {
+    python3 - "$1" <<'PYEOF'
+import re
+import sys
+import time
+
+match = re.fullmatch(r"([1-9][0-9]*)([mhd])", sys.argv[1])
+if not match:
+    print("Use a duration such as 30m, 2h, or 1d.", file=sys.stderr)
+    raise SystemExit(1)
+seconds = int(match[1]) * {"m": 60, "h": 3600, "d": 86400}[match[2]]
+if seconds > 7 * 86400:
+    print("Temporary pause cannot exceed 7 days.", file=sys.stderr)
+    raise SystemExit(1)
+print(int(time.time()) + seconds)
+PYEOF
+}
+
+remove_resume_schedule() {
+    if [[ -f "$RESUME_SYSTEMD_TIMER" || -f "$RESUME_SYSTEMD_SERVICE" ]]; then
+        has_systemd && systemctl disable --now kh-duo-resume.timer >/dev/null 2>&1 || true
+        rm -f "$RESUME_SYSTEMD_TIMER" "$RESUME_SYSTEMD_SERVICE"
+        has_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f "$RESUME_CRON_FILE"
+}
+
+install_resume_schedule() {
+    [[ "$PAUSE_RESUME_AT" =~ ^[0-9]+$ ]] || return 1
+    if has_systemd; then
+        local calendar
+        calendar="$(date -u -d "@$PAUSE_RESUME_AT" '+%Y-%m-%d %H:%M:%S UTC')" || return 1
+        cat > "$RESUME_SYSTEMD_SERVICE" <<EOF || return 1
+[Unit]
+Description=Restore Duo SSH after temporary pause
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_PATH --resume-if-due --no-menu --yes
+EOF
+        cat > "$RESUME_SYSTEMD_TIMER" <<EOF || return 1
+[Unit]
+Description=Restore Duo SSH after temporary pause
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+Unit=kh-duo-resume.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        chmod 644 "$RESUME_SYSTEMD_SERVICE" "$RESUME_SYSTEMD_TIMER" || return 1
+        if systemctl daemon-reload \
+            && systemctl enable --now kh-duo-resume.timer >/dev/null 2>&1 \
+            && systemctl is-enabled kh-duo-resume.timer >/dev/null 2>&1 \
+            && systemctl is-active kh-duo-resume.timer >/dev/null 2>&1; then
+            ok "Duo SSH scheduled to resume at $calendar"
+            return 0
+        fi
+        warn "Could not schedule systemd resume; trying cron"
+        remove_resume_schedule
+    fi
+    has_cron_daemon || return 1
+    cat > "$RESUME_CRON_FILE" <<EOF || return 1
+# Restore Duo SSH after a temporary pause (managed by install-duo-ssh.sh)
+SHELL=/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root $SCRIPT_PATH --resume-if-due --no-menu --yes >/dev/null 2>&1
+EOF
+    chmod 644 "$RESUME_CRON_FILE" || return 1
+    chown root:root "$RESUME_CRON_FILE" 2>/dev/null || true
+    ok "Duo SSH scheduled to resume by cron after $(date -u -d "@$PAUSE_RESUME_AT" '+%Y-%m-%d %H:%M UTC')"
+}
+
 ### ─── Interactive menu ──────────────────────────────────────────────────
 # Triggered when no flags are passed AND stdin is a TTY.  Sets the same
 # globals that the flag parser sets, so the rest of the script doesn't
@@ -1098,6 +1190,7 @@ read_paused_policy() {
             bypass_addrs) BYPASS_ADDRS="$value" ;;
             breakglass_user) BREAKGLASS_USER="$value" ;;
             failmode) [[ "$value" == safe || "$value" == secure ]] || die "Invalid saved failmode"; FAILMODE="$value" ;;
+            resume_at) [[ -z "$value" || "$value" =~ ^[0-9]+$ ]] || die "Invalid saved resume time"; PAUSE_RESUME_AT="$value" ;;
         esac
     done < "$DUO_PAUSED_CONF"
 }
@@ -1114,6 +1207,7 @@ save_paused_policy() {
         printf 'bypass_addrs=%s\n' "$BYPASS_ADDRS"
         printf 'breakglass_user=%s\n' "$BREAKGLASS_USER"
         printf 'failmode=%s\n' "$FAILMODE"
+        printf 'resume_at=%s\n' "$PAUSE_RESUME_AT"
     } > "$tmp"
     mv "$tmp" "$DUO_PAUSED_CONF"
 }
@@ -1228,7 +1322,7 @@ print_config_summary() {
     API host:         ${HOST:-(not set)}
 
   Login policy
-    Duo SSH:          $([[ -f "$DUO_PAUSED_CONF" ]] && echo 'OFF (policy saved)' || echo 'ON')
+    Duo SSH:          $(if [[ -f "$DUO_PAUSED_CONF" ]]; then if [[ -n "$PAUSE_RESUME_AT" ]]; then printf 'OFF (auto-resume: %s)' "$(date -u -d "@$PAUSE_RESUME_AT" '+%Y-%m-%d %H:%M UTC')"; else echo 'OFF (until manually enabled)'; fi; else echo 'ON'; fi)
     Auth mode:        $(if [[ -f "$DUO_PAUSED_CONF" ]]; then [[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password allowed (Duo off)' || echo 'publickey only (Duo off)'; else [[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password fallback ON everywhere (+ Duo unless bypassed)' || echo 'publickey + Duo only'; fi)
     Failmode:         $FAILMODE  ($([[ "$FAILMODE" == "secure" ]] && echo 'DENY login if Duo cloud unreachable' || echo 'allow first-factor if Duo cloud unreachable'))
     Localhost bypass: $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
@@ -1248,6 +1342,114 @@ EOF
 show_current_config() {
     read_existing_config
     print_config_summary
+}
+
+doctor_case() {
+    local label="$1" user="$2" addr="$3" expected="$4" output actual password
+    if ! output="$(sshd -T -C "user=$user,host=localhost,addr=$addr" 2>&1)"; then
+        err "$label: sshd could not evaluate this connection: $output"
+        return 1
+    fi
+    actual="$(printf '%s\n' "$output" | awk '$1 == "authenticationmethods" { $1=""; sub(/^ /, ""); print; exit }')"
+    password="$(printf '%s\n' "$output" | awk '$1 == "passwordauthentication" { print $2; exit }')"
+    printf '  %-22s %-39s password=%s\n' "$label ($addr)" "${actual:-unknown}" "${password:-unknown}"
+    if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+        err "$label: expected AuthenticationMethods '$expected', got '${actual:-unknown}'"
+        return 1
+    fi
+    if [[ "$password" != "$([[ $ALLOW_PASSWORD -eq 1 ]] && echo yes || echo no)" ]]; then
+        err "$label: PasswordAuthentication does not match the saved policy"
+        return 1
+    fi
+}
+
+doctor() {
+    log "Checking effective SSH login policy"
+    [[ -f "$SSHD_CONFIG" && -f "$PAM_SSHD" ]] || die "SSH configuration files are missing."
+    sshd -t || die "sshd configuration syntax check failed."
+    read_existing_config
+    local failures=0 user normal_addr expected bypass_expected cidr addr
+    user="${SUDO_USER:-root}"
+    getent passwd "$user" >/dev/null 2>&1 || user=root
+    if [[ -f "$DUO_PAUSED_CONF" ]]; then
+        if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_duo\.so' "$PAM_SSHD" || grep -q '^# kh-duo-sshd-begin' "$SSHD_CONFIG"; then
+            err "Duo is marked off, but a managed authentication rule remains active."
+            failures=$((failures + 1))
+        fi
+        [[ -n "$PAUSE_RESUME_AT" ]] && log "Auto-resume: $(date -u -d "@$PAUSE_RESUME_AT" '+%Y-%m-%d %H:%M UTC')"
+        if [[ -n "$PAUSE_RESUME_AT" && -f "$RESUME_CRON_FILE" ]] && ! has_cron_daemon; then
+            err "A cron resume task exists, but no usable cron daemon was found."
+            failures=$((failures + 1))
+        fi
+        if [[ -n "$PAUSE_RESUME_AT" && ! -f "$RESUME_CRON_FILE" ]]; then
+            if [[ ! -f "$RESUME_SYSTEMD_TIMER" ]] || ! has_systemd || ! systemctl is-enabled kh-duo-resume.timer >/dev/null 2>&1; then
+                err "A timed pause is saved, but no active automatic-resume task was found."
+                failures=$((failures + 1))
+            fi
+        fi
+        expected=""
+    else
+        if ! grep -Eq '^[[:space:]]*auth[[:space:]].*pam_duo\.so' "$PAM_SSHD" || ! grep -q '^# kh-duo-sshd-begin' "$SSHD_CONFIG"; then
+            err "Duo is marked on, but the managed SSH/PAM rules are incomplete."
+            failures=$((failures + 1))
+        fi
+        if [[ $ALLOW_PASSWORD -eq 1 ]] && has_duo_bypass; then
+            if ! grep -q 'pam_access\.so' "$PAM_SSHD" || ! is_managed_pam_bypass_config; then
+                err "Password bypass is configured, but the PAM bypass selector is missing."
+                failures=$((failures + 1))
+            fi
+        fi
+        if [[ $ALLOW_PASSWORD -eq 1 ]]; then
+            expected='publickey,keyboard-interactive:pam keyboard-interactive:pam'
+        else
+            expected='publickey,keyboard-interactive:pam'
+        fi
+    fi
+    normal_addr="$(python3 - "$BYPASS_ADDRS" <<'PYEOF'
+import ipaddress
+import sys
+networks = [ipaddress.ip_network(x) for x in sys.argv[1].split(',') if x]
+for value in ('192.0.2.1', '198.51.100.1', '203.0.113.1', '2001:db8::1'):
+    addr = ipaddress.ip_address(value)
+    if all(addr not in network for network in networks):
+        print(value)
+        break
+PYEOF
+)" || die "Could not select a test source address."
+    if [[ -n "$normal_addr" ]]; then
+        doctor_case "ordinary source" "$user" "$normal_addr" "$expected" || failures=$((failures + 1))
+    else
+        warn "No non-bypass sample address is available; ordinary-source check skipped."
+    fi
+    if [[ ! -f "$DUO_PAUSED_CONF" ]]; then
+        bypass_expected=publickey
+        [[ $ALLOW_PASSWORD -eq 1 ]] && bypass_expected='publickey keyboard-interactive:pam'
+        if [[ $BYPASS_LOCAL -eq 1 ]]; then
+            doctor_case localhost "$user" 127.0.0.1 "$bypass_expected" || failures=$((failures + 1))
+            doctor_case 'localhost IPv6' "$user" ::1 "$bypass_expected" || failures=$((failures + 1))
+        fi
+        if [[ -n "$BYPASS_ADDRS" ]]; then
+            local -a cidrs
+            IFS=',' read -r -a cidrs <<< "$BYPASS_ADDRS"
+            for cidr in "${cidrs[@]}"; do
+                addr="$(python3 - "$cidr" <<'PYEOF'
+import ipaddress, sys
+network = ipaddress.ip_network(sys.argv[1])
+print(network.network_address + (1 if network.num_addresses > 1 else 0))
+PYEOF
+)"
+                doctor_case "bypass $cidr" "$user" "$addr" "$bypass_expected" || failures=$((failures + 1))
+            done
+        fi
+        if [[ -n "$BREAKGLASS_USER" && -n "$normal_addr" ]]; then
+            doctor_case breakglass "$BREAKGLASS_USER" "$normal_addr" "$bypass_expected" || failures=$((failures + 1))
+        fi
+    fi
+    if (( failures > 0 )); then
+        err "Policy check found $failures problem(s)."
+        return 1
+    fi
+    ok "Effective SSH policy matches the saved settings. This does not perform a real login or Duo API check."
 }
 
 # Sub-menu: toggle individual settings without re-asking for credentials.
@@ -1292,9 +1494,13 @@ menu_adjust_settings() {
             1)  ALLOW_PASSWORD=$((1 - ALLOW_PASSWORD));  ok "Password fallback now: $([[ $ALLOW_PASSWORD -eq 1 ]] && echo ON || echo OFF)" ;;
             2)  BYPASS_LOCAL=$((1 - BYPASS_LOCAL));      ok "Localhost bypass now: $([[ $BYPASS_LOCAL -eq 1 ]] && echo ON || echo OFF)" ;;
             3)
-                local cidrs=""
-                read -r -p "  Bypass CIDRs (comma-separated, empty to clear): " cidrs
-                BYPASS_ADDRS="$cidrs"
+                local cidr_input="" normalized=""
+                read -r -p "  Bypass CIDRs (comma-separated, empty to clear): " cidr_input
+                if ! normalized="$(normalize_bypass_addrs "$cidr_input")"; then
+                    warn "CIDRs were not changed. Enter a corrected value and try again."
+                    continue
+                fi
+                BYPASS_ADDRS="$normalized"
                 ok "Extra bypass CIDRs: ${BYPASS_ADDRS:-(none)}"
                 ;;
             4)
@@ -1435,8 +1641,16 @@ install_wizard() {
     echo "  Password fallback, when enabled, also works in these networks without Duo."
     echo "  Press Enter to skip."
     local extra=""
-    menu_ask extra "Bypass CIDRs"
-    [[ -n "$extra" ]] && BYPASS_ADDRS="$extra"
+    while true; do
+        menu_ask extra "Bypass CIDRs"
+        [[ -z "$extra" ]] && break
+        local normalized=""
+        if normalized="$(normalize_bypass_addrs "$extra")"; then
+            BYPASS_ADDRS="$normalized"
+            break
+        fi
+        warn "Enter a corrected CIDR, or press Enter to skip."
+    done
 
     # ── Step 5/5 — breakglass user ─────────────────────────────────────
     echo
@@ -1499,6 +1713,7 @@ What would you like to do?
   5) Update settings                  (channel, mirror, auto-update task)
   6) Uninstall Duo 2FA
   7) Turn Duo SSH on/off            (keep credentials and login policy)
+  8) Check effective SSH policy
   q) Quit
 EOF
         echo
@@ -1520,8 +1735,10 @@ EOF
                     return 0
                 fi
                 confirm "Turn Duo SSH off (SSH will use its normal authentication policy)?" || continue
+                read -r -p "  Auto-resume after (30m, 2h, 1d; empty = manual): " PAUSE_DURATION
                 disable_duo
                 ;;
+            8)    doctor || true ;;
             q|Q)  ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
@@ -1670,10 +1887,9 @@ ensure_python3() {
 # the same network/mask form.  Canonicalizing here keeps both policy layers in
 # lockstep and prevents whitespace/config-line injection through a malformed
 # --bypass-addr value.
-validate_bypass_policy() {
-    if [[ -n "$BYPASS_ADDRS" ]]; then
-        local normalized
-        if ! normalized="$(python3 - "$BYPASS_ADDRS" <<'PYEOF'
+normalize_bypass_addrs() {
+    [[ -n "$1" ]] || { printf '\n'; return 0; }
+    python3 - "$1" <<'PYEOF'
 import ipaddress
 import sys
 
@@ -1691,6 +1907,9 @@ for value in items:
         network = ipaddress.ip_network(value, strict=True)
     except ValueError as exc:
         print(f"invalid bypass address/CIDR {value!r}: {exc}", file=sys.stderr)
+        if "has host bits set" in str(exc):
+            interface = ipaddress.ip_interface(value)
+            print(f"For only this address, use {interface.ip}/{interface.max_prefixlen}; for the whole network, use {interface.network}.", file=sys.stderr)
         raise SystemExit(1)
     canonical = str(network)
     if canonical not in seen:
@@ -1699,11 +1918,14 @@ for value in items:
 
 print(','.join(out))
 PYEOF
-        )"; then
-            die "Invalid --bypass-addr value. Use comma-separated IPv4/IPv6 addresses or CIDRs whose host bits are zero."
-        fi
-        BYPASS_ADDRS="$normalized"
+}
+
+validate_bypass_policy() {
+    local normalized
+    if ! normalized="$(normalize_bypass_addrs "$BYPASS_ADDRS")"; then
+        die "Invalid --bypass-addr value. Use IPv4/IPv6 addresses or CIDRs whose host bits are zero."
     fi
+    BYPASS_ADDRS="$normalized"
 
     if [[ -n "$BREAKGLASS_USER" ]]; then
         if [[ ! "$BREAKGLASS_USER" =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -2414,7 +2636,9 @@ PYEOF
             die "SSH service not active after restart; previous configuration restored"
         fi
         ok "Duo SSH is off. Saved policy can be restored with --enable-duo."
+        return 0
     else
+        remove_resume_schedule
         rm -f "$DUO_PAUSED_CONF"
         ok "Uninstalled. Duo no longer enforced on SSH."
     fi
@@ -2431,10 +2655,24 @@ disable_duo() {
     [[ -n "$IKEY" && -n "$SKEY" && -n "$HOST" ]] || die "Duo credentials are incomplete."
     ensure_python3
     validate_bypass_policy
+    if [[ -n "$PAUSE_DURATION" ]]; then
+        PAUSE_RESUME_AT="$(parse_pause_duration "$PAUSE_DURATION")" || die "Invalid pause duration."
+        if ! has_systemd && ! has_cron_daemon; then
+            die "Timed pause needs a working systemd timer or cron daemon."
+        fi
+    fi
     save_paused_policy
     PAUSE_ONLY=1
-    trap 'rollback; rm -f "$DUO_PAUSED_CONF"' ERR
+    trap 'rollback; remove_resume_schedule; rm -f "$DUO_PAUSED_CONF"' ERR
     do_uninstall
+    if [[ -n "$PAUSE_RESUME_AT" ]] && ! install_resume_schedule; then
+        rollback
+        remove_resume_schedule
+        rm -f "$DUO_PAUSED_CONF"
+        die "Could not schedule automatic resume; previous SSH configuration restored."
+    fi
+    trap - ERR
+    exit 0
 }
 
 ### ─── Lift conflicting overrides from /etc/ssh/sshd_config.d/ ────────────
@@ -2845,7 +3083,7 @@ run_migration_patches() {
 
     set_last_applied_version "$current"
 }
-run_migration_patches
+[[ $ACTION_DOCTOR -eq 1 ]] || run_migration_patches
 
 ### ─── Main ───────────────────────────────────────────────────────────────
 
@@ -2910,6 +3148,11 @@ fi
 
 require_root
 detect_os
+if [[ $ACTION_DOCTOR -eq 1 ]]; then
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for --doctor."
+    doctor
+    exit $?
+fi
 
 # Mirror config writes happen as root, before any heavier setup.
 if [[ $ACTION_SET_MIRROR -eq 1 ]]; then
@@ -2949,6 +3192,14 @@ if [[ $ACTION_REMOVE_AUTO_UPDATE -eq 1 ]]; then
 fi
 if [[ $ACTION_DISABLE_DUO -eq 1 ]]; then
     disable_duo
+fi
+if [[ $ACTION_RESUME_IF_DUE -eq 1 ]]; then
+    [[ -f "$DUO_PAUSED_CONF" ]] || exit 0
+    read_paused_policy
+    [[ -n "$PAUSE_RESUME_AT" ]] || exit 0
+    (( $(date +%s) >= PAUSE_RESUME_AT )) || exit 0
+    log "Temporary Duo SSH pause expired; restoring saved policy"
+    ACTION_ENABLE_DUO=1
 fi
 if [[ $ACTION_ENABLE_DUO -eq 1 ]]; then
     [[ -f "$DUO_PAUSED_CONF" ]] || die "Duo SSH is already on (or not installed)."
@@ -3151,6 +3402,7 @@ ok "SSH is $STATE"
 
 rm -f "$DUO_PAUSED_CONF"
 trap - ERR
+remove_resume_schedule || warn "Could not remove a stale automatic-resume task; it will be harmless while Duo is on."
 
 ### 8.4. Trim old install backup directories (keep newest BACKUP_RETENTION_COUNT)
 cleanup_old_backups "/root/duo-install-backup-*" dir

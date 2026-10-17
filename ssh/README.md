@@ -146,7 +146,9 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--no-auto-update` | 安装时**不要**自动注册更新任务（适合用 Ansible 等外部工具管理）。 |
 | `--uninstall` | 卸载 Duo SSH 2FA 并恢复 SSH 配置。 |
 | `--disable-duo` | 全局关闭 Duo SSH；保存登录策略，保留 Duo 凭据、软件包和自动更新任务。 |
+| `--disable-duo --for 30m` | 临时关闭 Duo，到期自动恢复；支持 `m`、`h`、`d`，最长 7 天。 |
 | `--enable-duo` | 用保存的策略重新开启 Duo SSH，无需重输凭据或 bypass 设置。 |
+| `--doctor` | 检查普通来源、绕过来源与 breakglass 用户实际生效的 SSH 认证方式。 |
 | `--no-menu` | 即使在 TTY 中也不进入交互菜单。 |
 | `-y`, `--yes` | 自动确认提示，适合自动化执行。 |
 | `-h`, `--help` | 显示帮助。 |
@@ -164,6 +166,7 @@ What would you like to do?
   5) Update settings
   6) Uninstall Duo 2FA
   7) Turn Duo SSH on/off
+  8) Check effective SSH policy
   q) Quit
 ```
 
@@ -179,6 +182,12 @@ Password fallback 与 bypass 是正交设置：打开 password fallback 后，�
 子菜单里多次切换会先在内存里累积，最后选 "6) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
 
 **全局开关（选项 7）**：关闭时恢复普通 SSH 认证，Duo 凭据保留在 `/etc/duo/pam_duo.conf`，当前登录策略另存至仅 root 可读的 `/etc/duo/ssh-paused.conf`。软件包和自动更新任务保持安装。再次选 7 或执行 `sudo kh-duo --enable-duo` 会重用保存的配置。关闭期间，原先允许密码登录的配置会恢复为普通密码登录；原先仅允许公钥的配置仍保持公钥登录。请保持一个现有 SSH 会话，直到验证新连接正常。
+
+临时关闭时可输入 `30m`、`2h`、`1d` 等时长。脚本会用 systemd timer（不可用时用 cron）安排恢复；如果无法安排任务，就恢复原 SSH 配置并报错。到期恢复若失败，保存的策略和任务会保留，方便重试和排查。手动开启或完全卸载会移除恢复任务。
+
+输入额外 bypass CIDR 时会立即校验。像 `198.23.159.178/28` 这样的值会同时提示单个地址 `198.23.159.178/32` 和完整网段 `198.23.159.176/28`，不会自动扩大绕过范围。
+
+`sudo kh-duo --doctor` 使用 `sshd -T -C` 检查各来源与用户的实际 SSH 认证策略，并核对 PAM 中的 Duo 配置；它不进行真实 SSH 登录或 Duo 云端连通性测试。
 
 **Show current configuration (选项 3)** 不动任何东西，只 dump 当前生效的设置（含 ikey 前 8 位脱敏）。
 
