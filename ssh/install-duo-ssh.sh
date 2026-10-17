@@ -36,6 +36,8 @@
 #   sudo ./install-duo-ssh.sh --failmode secure        # stricter — reject login outright when Duo
 #                                                        cloud is unreachable (risk: Duo outage = lockout)
 #   sudo ./install-duo-ssh.sh --uninstall              # revert to stock SSH config
+#   sudo ./install-duo-ssh.sh --disable-duo            # pause Duo, retain credentials and policy
+#   sudo ./install-duo-ssh.sh --enable-duo             # restore the saved Duo policy
 #   sudo ./install-duo-ssh.sh --no-menu                # force flag-driven mode even on TTY
 #
 # Maintenance:
@@ -97,6 +99,9 @@ HOST="${DUO_HOST:-}"
 BREAKGLASS_USER=""
 BYPASS_LOCAL=1
 BYPASS_ADDRS=""
+ACTION_DISABLE_DUO=0
+ACTION_ENABLE_DUO=0
+PAUSE_ONLY=0
 ALLOW_PASSWORD=0
 # pam_duo failmode: how PAM behaves when the Duo cloud is unreachable.
 #   safe   → fall through to first-factor only (publickey/password) — login still works
@@ -141,7 +146,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.7"
+SCRIPT_VERSION="1.7.8"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -212,6 +217,7 @@ PAM_SSHD="/etc/pam.d/sshd"
 PAM_DUO_CONF="/etc/duo/pam_duo.conf"
 LOGIN_DUO_CONF="/etc/duo/login_duo.conf"
 PAM_BYPASS_CONF="/etc/security/kh-duo-bypass.conf"
+DUO_PAUSED_CONF="/etc/duo/ssh-paused.conf"
 
 # Detected at runtime
 OS_FAMILY=""    # debian | rhel
@@ -247,6 +253,8 @@ while [[ $# -gt 0 ]]; do
         --skip-key-check) SKIP_KEY_CHECK=1; shift ;;
         --strict-publickey) STRICT_PUBLICKEY=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
+        --disable-duo)  ACTION_DISABLE_DUO=1; shift ;;
+        --enable-duo)   ACTION_ENABLE_DUO=1; shift ;;
         --no-menu)      NO_MENU=1; shift ;;
         --check-update) ACTION_CHECK_UPDATE=1; shift ;;
         --update|--self-update) ACTION_SELF_UPDATE=1; shift ;;
@@ -1080,6 +1088,36 @@ menu_check_and_update() {
 # "Adjust settings" and "Show current config" menu items.  Scopes parsing of
 # Match Address / Match User to the Duo block we wrote, so user-managed
 # unrelated Match blocks elsewhere in sshd_config aren't confused for ours.
+read_paused_policy() {
+    [[ -f "$DUO_PAUSED_CONF" ]] || return 1
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            allow_password) [[ "$value" == 0 || "$value" == 1 ]] || die "Invalid saved password policy"; ALLOW_PASSWORD="$value" ;;
+            bypass_local) [[ "$value" == 0 || "$value" == 1 ]] || die "Invalid saved localhost policy"; BYPASS_LOCAL="$value" ;;
+            bypass_addrs) BYPASS_ADDRS="$value" ;;
+            breakglass_user) BREAKGLASS_USER="$value" ;;
+            failmode) [[ "$value" == safe || "$value" == secure ]] || die "Invalid saved failmode"; FAILMODE="$value" ;;
+        esac
+    done < "$DUO_PAUSED_CONF"
+}
+
+save_paused_policy() {
+    [[ ! -e "$DUO_PAUSED_CONF" ]] || die "Duo is already paused."
+    mkdir -p "$(dirname "$DUO_PAUSED_CONF")"
+    local tmp
+    tmp="$(mktemp "${DUO_PAUSED_CONF}.XXXXXX")" || die "Could not save Duo policy"
+    chmod 600 "$tmp"
+    {
+        printf 'allow_password=%s\n' "$ALLOW_PASSWORD"
+        printf 'bypass_local=%s\n' "$BYPASS_LOCAL"
+        printf 'bypass_addrs=%s\n' "$BYPASS_ADDRS"
+        printf 'breakglass_user=%s\n' "$BREAKGLASS_USER"
+        printf 'failmode=%s\n' "$FAILMODE"
+    } > "$tmp"
+    mv "$tmp" "$DUO_PAUSED_CONF"
+}
+
 read_existing_config() {
     if [[ -f "$PAM_DUO_CONF" ]]; then
         IKEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*ikey[[:space:]]*=/{print $2; exit}' "$PAM_DUO_CONF")"
@@ -1093,6 +1131,13 @@ read_existing_config() {
         case "$_fm" in
             safe|secure) FAILMODE="$_fm" ;;
         esac
+    fi
+
+    # The live SSH block is removed while Duo is paused.  Read the saved
+    # policy instead so re-enabling never asks for the old settings again.
+    if [[ -f "$DUO_PAUSED_CONF" ]]; then
+        read_paused_policy
+        return 0
     fi
 
     if [[ ! -f "$SSHD_CONFIG" ]]; then return 0; fi
@@ -1183,7 +1228,8 @@ print_config_summary() {
     API host:         ${HOST:-(not set)}
 
   Login policy
-    Auth mode:        $([[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password fallback ON everywhere (+ Duo unless bypassed)' || echo 'publickey + Duo only')
+    Duo SSH:          $([[ -f "$DUO_PAUSED_CONF" ]] && echo 'OFF (policy saved)' || echo 'ON')
+    Auth mode:        $(if [[ -f "$DUO_PAUSED_CONF" ]]; then [[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password allowed (Duo off)' || echo 'publickey only (Duo off)'; else [[ $ALLOW_PASSWORD -eq 1 ]] && echo 'password fallback ON everywhere (+ Duo unless bypassed)' || echo 'publickey + Duo only'; fi)
     Failmode:         $FAILMODE  ($([[ "$FAILMODE" == "secure" ]] && echo 'DENY login if Duo cloud unreachable' || echo 'allow first-factor if Duo cloud unreachable'))
     Localhost bypass: $([[ $BYPASS_LOCAL -eq 1 ]] && echo 'ON  (127.0.0.0/8, ::1)' || echo 'OFF')
     Extra bypass:     ${BYPASS_ADDRS:-(none)}
@@ -1209,6 +1255,10 @@ show_current_config() {
 # runs the normal install pipeline using the updated globals.  Returns 1 (or
 # exits) if the user cancels.
 menu_adjust_settings() {
+    if [[ -f "$DUO_PAUSED_CONF" ]]; then
+        warn "Duo SSH is off. Turn it on before adjusting the login policy."
+        return 1
+    fi
     if [[ ! -f "$PAM_DUO_CONF" ]]; then
         warn "Cannot adjust settings — no Duo config at $PAM_DUO_CONF."
         warn "Use option 1 (Install / configure) for first-time setup."
@@ -1448,6 +1498,7 @@ What would you like to do?
   4) Check for and install updates
   5) Update settings                  (channel, mirror, auto-update task)
   6) Uninstall Duo 2FA
+  7) Turn Duo SSH on/off            (keep credentials and login policy)
   q) Quit
 EOF
         echo
@@ -1460,6 +1511,17 @@ EOF
             4)    menu_check_and_update ;;
             5)    menu_update_settings ;;
             6)    menu_uninstall_flow; return 0 ;;
+            7)
+                if [[ -f "$DUO_PAUSED_CONF" ]]; then
+                    read_existing_config
+                    ASSUME_YES=1
+                    NO_MENU=1
+                    INTERACTIVE_FLAGS_USED=1
+                    return 0
+                fi
+                confirm "Turn Duo SSH off (SSH will use its normal authentication policy)?" || continue
+                disable_duo
+                ;;
             q|Q)  ok "No changes made."; exit 0 ;;
             *)    warn "Invalid choice '$action'" ;;
         esac
@@ -2231,8 +2293,12 @@ PYEOF
 
 ### ─── Uninstall path ─────────────────────────────────────────────────────
 do_uninstall() {
-    log "Reverting SSH/Duo configuration"
-    uninstall_auto_update
+    if [[ $PAUSE_ONLY -eq 1 ]]; then
+        log "Turning Duo SSH off; keeping credentials, package, and update task"
+    else
+        log "Reverting SSH/Duo configuration"
+        uninstall_auto_update
+    fi
     backup_file "$SSHD_CONFIG"
     backup_file "$PAM_SSHD"
     backup_file "$PAM_BYPASS_CONF"
@@ -2318,7 +2384,7 @@ PYEOF
         for f in /etc/ssh/sshd_config.d/*.conf; do
             [[ -f "$f" ]] || continue
             if grep -qE '^# kh-duo-disabled: ' "$f"; then
-                backup_file "$f"
+                backup_and_track "$f"
                 sed -i -E 's|^# kh-duo-disabled: ||' "$f"
                 ok "Restored disabled directives in $f"
             fi
@@ -2326,21 +2392,49 @@ PYEOF
         shopt -u nullglob
     fi
 
-    # Remove packages and repos
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-        dpkg -l duo-unix    2>/dev/null | grep -q '^ii' && apt_get remove -y duo-unix              >/dev/null 2>&1 || true
-        dpkg -l libpam-duo  2>/dev/null | grep -q '^ii' && apt_get remove -y libpam-duo libduo3    >/dev/null 2>&1 || true
-        rm -f /etc/apt/sources.list.d/duosecurity.list
-        rm -f /usr/share/keyrings/duo-archive-keyring.gpg
-    elif [[ "$OS_FAMILY" == "rhel" ]]; then
-        rpm -q duo_unix >/dev/null 2>&1 && $PKG_MGR remove -y duo_unix >/dev/null 2>&1 || true
-        rm -f /etc/yum.repos.d/duosecurity.repo
+    if [[ $PAUSE_ONLY -eq 0 ]]; then
+        # Remove packages and repos only for a full uninstall.
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            dpkg -l duo-unix    2>/dev/null | grep -q '^ii' && apt_get remove -y duo-unix              >/dev/null 2>&1 || true
+            dpkg -l libpam-duo  2>/dev/null | grep -q '^ii' && apt_get remove -y libpam-duo libduo3    >/dev/null 2>&1 || true
+            rm -f /etc/apt/sources.list.d/duosecurity.list
+            rm -f /usr/share/keyrings/duo-archive-keyring.gpg
+        elif [[ "$OS_FAMILY" == "rhel" ]]; then
+            rpm -q duo_unix >/dev/null 2>&1 && $PKG_MGR remove -y duo_unix >/dev/null 2>&1 || true
+            rm -f /etc/yum.repos.d/duosecurity.repo
+        fi
     fi
 
     sshd -t
     restart_sshd
-    ok "Uninstalled. Duo no longer enforced on SSH."
+    if [[ $PAUSE_ONLY -eq 1 ]]; then
+        if [[ "$(sshd_service_state)" != active ]]; then
+            rollback
+            rm -f "$DUO_PAUSED_CONF"
+            die "SSH service not active after restart; previous configuration restored"
+        fi
+        ok "Duo SSH is off. Saved policy can be restored with --enable-duo."
+    else
+        rm -f "$DUO_PAUSED_CONF"
+        ok "Uninstalled. Duo no longer enforced on SSH."
+    fi
     exit 0
+}
+
+disable_duo() {
+    [[ ! -f "$DUO_PAUSED_CONF" ]] || die "Duo SSH is already off."
+    [[ -f "$PAM_DUO_CONF" ]] || die "Duo SSH is not installed."
+    [[ -f "$SSHD_CONFIG" && -f "$PAM_SSHD" ]] || die "SSH configuration is missing."
+    grep -q '# duo-stack-begin' "$PAM_SSHD" || die "Managed Duo PAM stack not found; refusing to change SSH."
+    grep -Eq '^# kh-duo-sshd-begin|^# === Duo 2FA for SSH' "$SSHD_CONFIG" || die "Managed Duo SSH block not found; refusing to change SSH."
+    read_existing_config
+    [[ -n "$IKEY" && -n "$SKEY" && -n "$HOST" ]] || die "Duo credentials are incomplete."
+    ensure_python3
+    validate_bypass_policy
+    save_paused_policy
+    PAUSE_ONLY=1
+    trap 'rollback; rm -f "$DUO_PAUSED_CONF"' ERR
+    do_uninstall
 }
 
 ### ─── Lift conflicting overrides from /etc/ssh/sshd_config.d/ ────────────
@@ -2853,6 +2947,16 @@ if [[ $ACTION_REMOVE_AUTO_UPDATE -eq 1 ]]; then
     uninstall_auto_update
     exit 0
 fi
+if [[ $ACTION_DISABLE_DUO -eq 1 ]]; then
+    disable_duo
+fi
+if [[ $ACTION_ENABLE_DUO -eq 1 ]]; then
+    [[ -f "$DUO_PAUSED_CONF" ]] || die "Duo SSH is already on (or not installed)."
+    read_existing_config
+    [[ -n "$IKEY" && -n "$SKEY" && -n "$HOST" ]] || die "Saved Duo credentials are incomplete."
+    ASSUME_YES=1
+    NO_MENU=1
+fi
 
 # --reinstall: read existing creds + toggles, full uninstall (in subshell so
 # its exit doesn't kill us), then exec self with the saved state to redo a
@@ -3045,6 +3149,7 @@ STATE="$(sshd_service_state)"
 [[ "$STATE" == "active" ]] || die "SSH service not active after restart (state: $STATE)"
 ok "SSH is $STATE"
 
+rm -f "$DUO_PAUSED_CONF"
 trap - ERR
 
 ### 8.4. Trim old install backup directories (keep newest BACKUP_RETENTION_COUNT)

@@ -145,6 +145,8 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--remove-auto-update` | 移除自动更新任务（systemd 和 cron 两边都清）。 |
 | `--no-auto-update` | 安装时**不要**自动注册更新任务（适合用 Ansible 等外部工具管理）。 |
 | `--uninstall` | 卸载 Duo SSH 2FA 并恢复 SSH 配置。 |
+| `--disable-duo` | 全局关闭 Duo SSH；保存登录策略，保留 Duo 凭据、软件包和自动更新任务。 |
+| `--enable-duo` | 用保存的策略重新开启 Duo SSH，无需重输凭据或 bypass 设置。 |
 | `--no-menu` | 即使在 TTY 中也不进入交互菜单。 |
 | `-y`, `--yes` | 自动确认提示，适合自动化执行。 |
 | `-h`, `--help` | 显示帮助。 |
@@ -158,10 +160,11 @@ What would you like to do?
   1) Install / configure Duo 2FA  (default — full setup with new credentials)
   2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
   3) Show current configuration
-  4) Uninstall Duo 2FA
-  5) Check for script updates
-  6) Install / refresh the 'kh-duo' shortcut
-  7) Quit without changes
+  4) Check for and install updates
+  5) Update settings
+  6) Uninstall Duo 2FA
+  7) Turn Duo SSH on/off
+  q) Quit
 ```
 
 **Adjust settings (选项 2)** 是 v1.2.0 新增的：自动从 `/etc/duo/pam_duo.conf` 和 `/etc/ssh/sshd_config` 的 Duo 块读出当前 ikey/skey/host 和所有开关，让你在不重新输凭据的情况下切换：
@@ -173,7 +176,9 @@ What would you like to do?
 
 Password fallback 与 bypass 是正交设置：打开 password fallback 后，所有来源都能使用密码；普通来源仍需 Duo，而命中 localhost、额外 CIDR 或 breakglass user 的连接只校验系统密码、不调用 Duo。关闭 password fallback 时，所有 bypass 仍保持 publickey-only。
 
-子菜单里多次切换会先在内存里累积，最后选 "5) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
+子菜单里多次切换会先在内存里累积，最后选 "6) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
+
+**全局开关（选项 7）**：关闭时恢复普通 SSH 认证，Duo 凭据保留在 `/etc/duo/pam_duo.conf`，当前登录策略另存至仅 root 可读的 `/etc/duo/ssh-paused.conf`。软件包和自动更新任务保持安装。再次选 7 或执行 `sudo kh-duo --enable-duo` 会重用保存的配置。关闭期间，原先允许密码登录的配置会恢复为普通密码登录；原先仅允许公钥的配置仍保持公钥登录。请保持一个现有 SSH 会话，直到验证新连接正常。
 
 **Show current configuration (选项 3)** 不动任何东西，只 dump 当前生效的设置（含 ikey 前 8 位脱敏）。
 
