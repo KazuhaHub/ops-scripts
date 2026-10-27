@@ -152,7 +152,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 # overrides are validated below so an attacker who can leak env through sudo
 # cannot redirect self-update to an arbitrary host or place the shortcut in
 # a sensitive location.
-SCRIPT_VERSION="1.7.9"
+SCRIPT_VERSION="1.7.10"
 
 # Update channel URLs.  `stable` is the default and what most fleet hosts
 # should track.  `beta` is for hosts willing to validate new releases — push
@@ -1734,6 +1734,7 @@ EOF
                     INTERACTIVE_FLAGS_USED=1
                     return 0
                 fi
+                disable_duo_preflight || continue
                 confirm "Turn Duo SSH off (SSH will use its normal authentication policy)?" || continue
                 read -r -p "  Auto-resume after (30m, 2h, 1d; empty = manual): " PAUSE_DURATION
                 disable_duo
@@ -2577,6 +2578,9 @@ for line in lines:
         continue
     if re.search(r'install-duo-ssh\.sh', line):
         continue
+    # Pre-marker installs left this note above the commented common-auth.
+    if re.match(r'^# common-auth disabled\b.*Duo', line):
+        continue
     # Debian: uncomment common-auth
     if re.match(r'^\s*#\s*@include\s+common-auth', line):
         out.append(re.sub(r'^\s*#\s*', '', line))
@@ -2645,12 +2649,22 @@ PYEOF
     exit 0
 }
 
+# Checks that must pass before Duo SSH can be turned off.  Kept separate so
+# the menu can run them before asking any questions.  Pre-marker installs
+# wrote a bare `auth ... pam_duo.so` line (no duo-stack-begin/end), so that
+# layout is accepted too; do_uninstall already knows how to strip it.
+disable_duo_preflight() {
+    [[ ! -f "$DUO_PAUSED_CONF" ]] || { err "Duo SSH is already off."; return 1; }
+    [[ -f "$PAM_DUO_CONF" ]] || { err "Duo SSH is not installed."; return 1; }
+    [[ -f "$SSHD_CONFIG" && -f "$PAM_SSHD" ]] || { err "SSH configuration is missing."; return 1; }
+    grep -Eq '^# duo-stack-begin|^[[:space:]]*auth[[:space:]]+[^#[:space:]]+[[:space:]]+[^[:space:]]*pam_duo\.so' "$PAM_SSHD" \
+        || { err "Managed Duo PAM stack not found; refusing to change SSH."; return 1; }
+    grep -Eq '^# kh-duo-sshd-begin|^# === Duo 2FA for SSH' "$SSHD_CONFIG" \
+        || { err "Managed Duo SSH block not found; refusing to change SSH."; return 1; }
+}
+
 disable_duo() {
-    [[ ! -f "$DUO_PAUSED_CONF" ]] || die "Duo SSH is already off."
-    [[ -f "$PAM_DUO_CONF" ]] || die "Duo SSH is not installed."
-    [[ -f "$SSHD_CONFIG" && -f "$PAM_SSHD" ]] || die "SSH configuration is missing."
-    grep -q '# duo-stack-begin' "$PAM_SSHD" || die "Managed Duo PAM stack not found; refusing to change SSH."
-    grep -Eq '^# kh-duo-sshd-begin|^# === Duo 2FA for SSH' "$SSHD_CONFIG" || die "Managed Duo SSH block not found; refusing to change SSH."
+    disable_duo_preflight || exit 1
     read_existing_config
     [[ -n "$IKEY" && -n "$SKEY" && -n "$HOST" ]] || die "Duo credentials are incomplete."
     ensure_python3
