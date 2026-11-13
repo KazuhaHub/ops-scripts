@@ -131,11 +131,11 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--ikey VALUE` | Duo Integration Key。 |
 | `--skey VALUE` | Duo Secret Key。 |
 | `--host VALUE` | Duo API hostname。 |
-| `--breakglass USER` | 指定一个紧急用户绕过 Duo，仅允许 public key。 |
+| `--breakglass USER` | 指定一个紧急用户绕过 Duo；开启 `--allow-password` 时该用户也可用密码，否则仅允许 public key。 |
 | `--bypass-local` | 对 localhost 连接绕过 Duo，默认开启。 |
 | `--no-bypass-local` | 关闭 localhost 绕过。 |
-| `--bypass-addr CIDR` | 指定额外绕过 Duo 的来源网段，可重复使用。 |
-| `--allow-password` | 强制开启 password + Duo fallback（即使有 SSH key）。 |
+| `--bypass-addr CIDR` | 指定额外绕过 Duo 的来源网段，可重复使用。开启 password fallback 时，这些网段可用 password 但不触发 Duo。 |
+| `--allow-password` | 强制开启 password fallback（即使有 SSH key）：普通连接使用 password + Duo，bypass 地址/用户使用 password only。 |
 | `--strict-publickey` | 强制 publickey-only，没找到 key 时直接 abort（不允许密码登录）。 |
 | `--skip-key-check` | 跳过 authorized_keys 检查。 |
 | `--use-cdn PROVIDER` | 一键切换更新源到指定 CDN：`jsdelivr` / `statically` / `github`（v1.6.1+）。 |
@@ -145,6 +145,10 @@ sudo DUO_IKEY=DIXXXXXXXXXXXXXXXXXX \
 | `--remove-auto-update` | 移除自动更新任务（systemd 和 cron 两边都清）。 |
 | `--no-auto-update` | 安装时**不要**自动注册更新任务（适合用 Ansible 等外部工具管理）。 |
 | `--uninstall` | 卸载 Duo SSH 2FA 并恢复 SSH 配置。 |
+| `--disable-duo` | 全局关闭 Duo SSH；保存登录策略，保留 Duo 凭据、软件包和自动更新任务。 |
+| `--disable-duo --for 30m` | 临时关闭 Duo，到期自动恢复；支持 `m`、`h`、`d`，最长 7 天。 |
+| `--enable-duo` | 用保存的策略重新开启 Duo SSH，无需重输凭据或 bypass 设置。 |
+| `--doctor` | 检查普通来源、绕过来源与 breakglass 用户实际生效的 SSH 认证方式。 |
 | `--no-menu` | 即使在 TTY 中也不进入交互菜单。 |
 | `-y`, `--yes` | 自动确认提示，适合自动化执行。 |
 | `-h`, `--help` | 显示帮助。 |
@@ -158,10 +162,12 @@ What would you like to do?
   1) Install / configure Duo 2FA  (default — full setup with new credentials)
   2) Adjust settings              (keep credentials; change auth/bypass/breakglass)
   3) Show current configuration
-  4) Uninstall Duo 2FA
-  5) Check for script updates
-  6) Install / refresh the 'kh-duo' shortcut
-  7) Quit without changes
+  4) Check for and install updates
+  5) Update settings
+  6) Uninstall Duo 2FA
+  7) Turn Duo SSH on/off
+  8) Check effective SSH policy
+  q) Quit
 ```
 
 **Adjust settings (选项 2)** 是 v1.2.0 新增的：自动从 `/etc/duo/pam_duo.conf` 和 `/etc/ssh/sshd_config` 的 Duo 块读出当前 ikey/skey/host 和所有开关，让你在不重新输凭据的情况下切换：
@@ -171,7 +177,17 @@ What would you like to do?
 - 额外的 bypass CIDR（多个用逗号隔开）
 - breakglass user
 
-子菜单里多次切换会先在内存里累积，最后选 "5) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
+Password fallback 与 bypass 是正交设置：打开 password fallback 后，所有来源都能使用密码；普通来源仍需 Duo，而命中 localhost、额外 CIDR 或 breakglass user 的连接只校验系统密码、不调用 Duo。关闭 password fallback 时，所有 bypass 仍保持 publickey-only。
+
+子菜单里多次切换会先在内存里累积，最后选 "6) Apply pending changes" 一次性写文件 + 重启 sshd。期间任何时候 `q` 都能放弃改动退出。
+
+**全局开关（选项 7）**：关闭时恢复普通 SSH 认证，Duo 凭据保留在 `/etc/duo/pam_duo.conf`，当前登录策略另存至仅 root 可读的 `/etc/duo/ssh-paused.conf`。软件包和自动更新任务保持安装。再次选 7 或执行 `sudo kh-duo --enable-duo` 会重用保存的配置。关闭期间，原先允许密码登录的配置会恢复为普通密码登录；原先仅允许公钥的配置仍保持公钥登录。请保持一个现有 SSH 会话，直到验证新连接正常。
+
+临时关闭时可输入 `30m`、`2h`、`1d` 等时长。脚本会用 systemd timer（不可用时用 cron）安排恢复；如果无法安排任务，就恢复原 SSH 配置并报错。到期恢复若失败，保存的策略和任务会保留，方便重试和排查。手动开启或完全卸载会移除恢复任务。
+
+输入额外 bypass CIDR 时会立即校验。像 `198.23.159.178/28` 这样的值会同时提示单个地址 `198.23.159.178/32` 和完整网段 `198.23.159.176/28`，不会自动扩大绕过范围。
+
+`sudo kh-duo --doctor` 使用 `sshd -T -C` 检查各来源与用户的实际 SSH 认证策略，并核对 PAM 中的 Duo 配置；它不进行真实 SSH 登录或 Duo 云端连通性测试。
 
 **Show current configuration (选项 3)** 不动任何东西，只 dump 当前生效的设置（含 ikey 前 8 位脱敏）。
 
@@ -322,7 +338,7 @@ update_url = https://cdn.jsdelivr.net/gh/KazuhaHub/ops-scripts@master/ssh/instal
 sudo ./install-duo-ssh.sh --uninstall
 ```
 
-卸载会尽量移除脚本写入的 Duo PAM 配置、SSH `AuthenticationMethods` 配置、Duo 软件包和仓库配置，并重启 SSH 服务。
+卸载会尽量移除脚本写入的 Duo PAM 配置、password/bypass selector、SSH `AuthenticationMethods` 配置、Duo 软件包和仓库配置，并重启 SSH 服务。
 
 ### 备份和回滚
 
@@ -401,15 +417,22 @@ sudo /usr/local/sbin/install-duo-ssh.sh --update --no-menu --yes
 | 现状 | 默认行为 |
 | --- | --- |
 | 找到 SSH key | publickey + Duo（password 拒绝）—— 推荐配置 |
-| 没有 SSH key | **publickey OR password + Duo**（避免管理员锁死自己），同时**大字提醒**强烈建议加 key |
+| 没有 SSH key | 自动打开 password fallback：普通来源 password + Duo，bypass 来源 password only（避免管理员锁死自己），同时**大字提醒**强烈建议加 key |
 
 `--allow-password` 仍然能强制打开 password fallback（即使有 key）；`--strict-publickey` 则强制走 key-only，没有 key 时直接 abort。这两个 flag 互斥，优先级高于自动检测。
+
+| 来源 / 用户 | Password fallback 关闭 | Password fallback 开启 |
+| --- | --- | --- |
+| 普通连接 | publickey + Duo | publickey + password + Duo，或 password + Duo |
+| localhost / `--bypass-addr` | publickey only，无 Duo | publickey 或 password，无 Duo |
+| `--breakglass` user | publickey only，无 Duo | publickey 或 password，无 Duo |
 
 向导（`sudo kh-duo` 进菜单选 1）的 Step 2/5 也会按这个逻辑选择默认值，并在没找到 key 时把"强烈建议加 key"放在最显眼的位置。
 
 ### 安全注意事项
 
 - 不要把 Duo `skey` 提交到 Git 仓库或写进共享日志。
+- `--allow-password` 与任何 bypass 同时开启时，命中该 bypass 的连接是单因素密码登录；只把受控管理网段加入 `--bypass-addr`。
 - 首次安装时保留一个已登录的 SSH 会话。
 - 推荐配置一个受控的 `--breakglass` 用户，用于 Duo 服务异常时的紧急恢复。
 - 对生产服务器执行前，先在测试机验证登录流程。
